@@ -1,0 +1,138 @@
+/**
+ * Mini-NCCL: A lightweight collective communication library.
+ * Designed for learning RDMA and Ring-AllReduce algorithms.
+ * Architecture Reference: PyTorch Gloo
+ * Author: gongxudong
+ * email: markxdgong@outlook.com
+ * Data: [2026/02/04]
+ */
+
+#pragma once
+
+#include <vector>
+#include <memory>
+#include <string>
+#include <stdexcept>
+#include <cstdint>
+
+namespace mini_nccl {
+
+// =============================================================
+// 1. 内存抽象 (Memory Abstraction)
+// =============================================================
+
+/**
+ * MemoryRegion: 封装 RDMA 的内存注册 (Memory Registration).
+ * 在 RDMA 中，发送/接收的数据必须先注册到网卡，获取 lkey/rkey。
+ * 普通 TCP 不需要这个，但为了统一接口，我们需要它。
+ */
+class MemoryRegion {
+public:
+    virtual ~MemoryRegion() = default;
+    
+    // 获取数据的原始指针
+    virtual void* ptr() const = 0;
+    
+    // 获取数据大小
+    virtual size_t size() const = 0;
+};
+
+// =============================================================
+// 2. 传输层抽象 (Transport Abstraction)
+// =============================================================
+
+// 前置声明
+class Context;
+
+/**
+ * Request: 异步操作的句柄
+ * 类似于 std::future，用于等待发送/接收完成。
+ */
+class Request {
+public:
+    virtual ~Request() = default;
+    
+    // 阻塞等待操作完成
+    // 如果通信失败，这里应该抛出异常
+    virtual void wait() = 0;
+    
+    // 检查是否完成 (非阻塞)
+    virtual bool isCompleted() const = 0;
+};
+
+/**
+ * Transport: 负责底层的点对点通信
+ * 这是一个抽象基类。我们将实现具体的 RDMATransport。
+ */
+class Transport {
+public:
+    virtual ~Transport() = default;
+
+    // 初始化传输层 (例如建立 QP 连接，或者 TCP 握手)
+    virtual void init() = 0;
+
+    // 核心接口：发送数据 (非阻塞)
+    // rank: 目标节点的 ID
+    // mr: 已经注册好的内存区域
+    // offset: 内存区域内的偏移量
+    // length: 发送长度
+    virtual std::shared_ptr<Request> isend(int rank, 
+                                           std::shared_ptr<MemoryRegion> mr, 
+                                           size_t offset, 
+                                           size_t length) = 0;
+
+    // 核心接口：接收数据 (非阻塞)
+    // rank: 来源节点的 ID
+    virtual std::shared_ptr<Request> irecv(int rank, 
+                                           std::shared_ptr<MemoryRegion> mr, 
+                                           size_t offset, 
+                                           size_t length) = 0;
+    
+    // 注册内存 (将普通指针变成 RDMA 可用的 MR)
+    virtual std::shared_ptr<MemoryRegion> registerMemory(void* ptr, size_t size) = 0;
+};
+
+// =============================================================
+// 3. 上下文 (Context)
+// =============================================================
+
+/**
+ * Context: 全局视图
+ * 类似于 MPI_COMM_WORLD。它知道“我是谁”以及“总共有多少人”。
+ */
+class Context {
+public:
+    Context(int rank, int size, std::shared_ptr<Transport> transport)
+        : rank_(rank), size_(size), transport_(transport) {}
+
+    // 基础信息
+    int rank() const { return rank_; } // 当前节点的 ID (0, 1, 2...)
+    int size() const { return size_; } // 总节点数
+
+    // 获取传输层实例
+    std::shared_ptr<Transport> transport() { return transport_; }
+
+    // 简化的注册内存接口
+    std::shared_ptr<MemoryRegion> registerMemory(void* ptr, size_t size) {
+        return transport_->registerMemory(ptr, size);
+    }
+
+private:
+    int rank_;
+    int size_;
+    std::shared_ptr<Transport> transport_;
+};
+
+// =============================================================
+// 4. 算法接口 (Collectives)
+// =============================================================
+
+/**
+ * 核心算法入口: AllReduce
+ * data: 数据指针
+ * count: 元素个数 (注意不是字节数)
+ * ctx: 上下文
+ */
+void allreduce(float* data, int count, std::shared_ptr<Context> ctx);
+
+} // namespace mini_nccl
