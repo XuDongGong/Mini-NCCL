@@ -46,7 +46,6 @@ class Context;
 
 /**
  * Request: 异步操作的句柄
- * 类似于 std::future，用于等待发送/接收完成。
  */
 class Request {
 public:
@@ -62,7 +61,7 @@ public:
 
 /**
  * Transport: 负责底层的点对点通信
- * 这是一个抽象基类。我们将实现具体的 RDMATransport。
+ * 抽象基类，需要实现具体的 RDMATransport。
  */
 class Transport {
 public:
@@ -98,7 +97,6 @@ public:
 
 /**
  * Context: 全局视图
- * 类似于 MPI_COMM_WORLD。它知道“我是谁”以及“总共有多少人”。
  */
 class Context {
 public:
@@ -130,7 +128,7 @@ private:
 /**
  * 核心算法入口: AllReduce
  * data: 数据指针
- * count: 元素个数 (注意不是字节数)
+ * count: 元素个数，不是字节数
  * ctx: 上下文
  */
 void allreduce(float* data, int count, std::shared_ptr<Context> ctx);
