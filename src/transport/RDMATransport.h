@@ -42,16 +42,23 @@ class RDMATransport; // Forward decl
 // RDMA 请求对象：用于追踪 isend/irecv 的状态
 class RDMARequest : public Request {
 public:
-    RDMARequest(RDMATransport* transport, uint64_t wr_id) 
-        : transport_(transport), wr_id_(wr_id), completed_(false) {}
+    // 默认构造，用于 vector 初始化
+    RDMARequest() : transport_(nullptr), wr_id_(0), completed_(false), pool_idx_(-1) {}
 
-    // 等待直到完成
+    // 初始化方法 (替代构造函数)
+    void reset(RDMATransport* transport, uint64_t wr_id, int pool_idx) {
+        transport_ = transport;
+        wr_id_ = wr_id;
+        pool_idx_ = pool_idx;
+        completed_ = false;
+    }
+
     void wait() override; 
     
-    // 检查是否完成
+    // 归还自己
+    void release() override;
+
     bool isCompleted() const override { return completed_; }
-    
-    // 内部使用：标记完成
     void markCompleted() { completed_ = true; }
     uint64_t id() const { return wr_id_; }
 
@@ -59,36 +66,64 @@ private:
     RDMATransport* transport_;
     uint64_t wr_id_;
     volatile bool completed_;
+    int pool_idx_; // 记录自己在 pool 中的位置，方便归还
 };
 
 class RDMATransport : public Transport {
 public:
-    RDMATransport(int rank, int nRanks, std::string root_ip = "127.0.0.1") 
+RDMATransport(int rank, int nRanks, std::string root_ip = "127.0.0.1") 
         : rank_(rank), nRanks_(nRanks), root_ip_(root_ip) {
         setup_device();
+        
+        // --- 预分配内存池 ---
+        // 预分配 1024 个请求对象，足够双缓冲流水线跑满
+        // 实际 NCCL 会动态扩容，这里简化为固定大小
+        int pool_size = 10240; 
+        request_pool_.resize(pool_size);
+        free_indices_.reserve(pool_size);
+        for (int i = 0; i < pool_size; ++i) {
+            free_indices_.push_back(i);
+        }
     }
 
     ~RDMATransport() {
-        // 清理资源... (略，保持之前的逻辑)
+        // ... (清理逻辑保持不变) ...
+        for (auto& pair : qps_) if (pair.second) ibv_destroy_qp(pair.second);
+        if (cq_) ibv_destroy_cq(cq_);
+        if (pd_) ibv_dealloc_pd(pd_);
+        if (ctx_) ibv_close_device(ctx_);
     }
 
-    // 复用之前的 init 逻辑 (这里为了节省篇幅简写，请保留你之前文件中完整的 init 实现!)
-    // *** 核心：请确保这里是你上一步提交的完整 init 代码 ***
     void init() override {
-        // ... (此处代码与上一步完全一致，请保留原样) ...
-        // 为了方便，我在下面完整写出来，确保你不小心删掉
         create_qps();
-        exchange_and_connect(); 
+        exchange_and_connect();
+    }
+
+    // --- 对象池分配逻辑 ---
+    RDMARequest* allocateRequest(uint64_t wr_id) {
+        if (free_indices_.empty()) {
+            throw std::runtime_error("Request Pool Exhausted! (Circular buffer full)");
+        }
+        int idx = free_indices_.back();
+        free_indices_.pop_back();
+
+        RDMARequest* req = &request_pool_[idx];
+        req->reset(this, wr_id, idx);
+        return req;
+    }
+
+    // --- 对象池回收逻辑 ---
+    void freeRequest(int idx) {
+        // 简单压栈
+        free_indices_.push_back(idx);
     }
 
     std::shared_ptr<MemoryRegion> registerMemory(void* ptr, size_t size) override {
         return std::make_shared<RDMAMemoryRegion>(pd_, ptr, size);
     }
 
-    // =============================================================
-    // 核心实现：异步发送 (Isend)
-    // =============================================================
-    std::shared_ptr<Request> isend(int rank, std::shared_ptr<MemoryRegion> mr, size_t offset, size_t length) override {
+    // --- isend (零分配版) ---
+    Request* isend(int rank, std::shared_ptr<MemoryRegion> mr, size_t offset, size_t length) override {
         auto rmr = std::static_pointer_cast<RDMAMemoryRegion>(mr);
         uint64_t wr_id = next_wr_id_++;
         
@@ -109,13 +144,12 @@ public:
             throw std::runtime_error("ibv_post_send failed");
         }
 
-        return std::make_shared<RDMARequest>(this, wr_id);
+        // 从池中拿，而不是 new
+        return allocateRequest(wr_id);
     }
 
-    // =============================================================
-    // 核心实现：异步接收 (Irecv)
-    // =============================================================
-    std::shared_ptr<Request> irecv(int rank, std::shared_ptr<MemoryRegion> mr, size_t offset, size_t length) override {
+    // --- irecv (零分配版) ---
+    Request* irecv(int rank, std::shared_ptr<MemoryRegion> mr, size_t offset, size_t length) override {
         auto rmr = std::static_pointer_cast<RDMAMemoryRegion>(mr);
         uint64_t wr_id = next_wr_id_++;
 
@@ -134,13 +168,9 @@ public:
             throw std::runtime_error("ibv_post_recv failed");
         }
 
-        return std::make_shared<RDMARequest>(this, wr_id);
+        return allocateRequest(wr_id);
     }
 
-    // =============================================================
-    // 轮询引擎 (Polling Engine)
-    // =============================================================
-    // 这是一个关键函数：它去 CQ 里捞数据，捞到了就去更新对应的 Request 状态
     void poll() {
         struct ibv_wc wc[16];
         int n = ibv_poll_cq(cq_, 16, wc);
@@ -151,21 +181,23 @@ public:
                 std::cerr << "WC Error: " << ibv_wc_status_str(wc[i].status) << std::endl;
                 throw std::runtime_error("Work Completion Error");
             }
-            // 将完成的 ID 加入集合
             completed_ids_.insert(wc[i].wr_id);
         }
     }
 
-    // 检查某个 ID 是否完成
     bool check_completion(uint64_t wr_id) {
-        poll(); // 每次检查前都尝试捞一把
+        poll(); 
         if (completed_ids_.count(wr_id)) {
-            // 如果完成了，为了节省内存，可以删掉它（这就要求 Request 只能 wait 一次）
-            // 简单起见，这里不删，或者用更复杂的数据结构管理
+            // 优化：一旦确认完成，立刻从 set 中移除，防止 set 无限膨胀
+            // (这是 v1.3.1 的一个小优化)
+            completed_ids_.erase(wr_id);
             return true;
         }
         return false;
     }
+
+    // 友元声明，允许 Request 访问 freeRequest
+    friend class RDMARequest;
 
 private:
     int rank_;
@@ -178,6 +210,10 @@ private:
     
     uint64_t next_wr_id_ = 0;
     std::unordered_set<uint64_t> completed_ids_; // 已完成的任务ID池
+
+    // --- 👇 内存池数据结构 ---
+    std::vector<RDMARequest> request_pool_; // 连续内存块，Cache 友好
+    std::vector<int> free_indices_;         // 空闲栈
 
     // ... (保留 setup_device, create_qp, connect_qp 等私有辅助函数) ...
     // 为了代码简洁，请把上一步写好的辅助函数都贴在这里
@@ -318,6 +354,10 @@ inline void RDMARequest::wait() {
             completed_ = true;
         }
     }
+}
+
+inline void RDMARequest::release() {
+    transport_->freeRequest(pool_idx_);
 }
 
 } // namespace mini_nccl

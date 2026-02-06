@@ -27,7 +27,6 @@ void launch_cuda_kernel(const float* a, const float* b, float* c, int n, cudaStr
     vec_add_kernel<<<blocks, threads, 0, stream>>>(a, b, c, n);
 }
 
-// 接口变更：增加 cudaStream_t stream
 void allreduce(float* data, int count, std::shared_ptr<Context> ctx, cudaStream_t stream) {
     int rank = ctx->rank();
     int size = ctx->size();
@@ -47,10 +46,8 @@ void allreduce(float* data, int count, std::shared_ptr<Context> ctx, cudaStream_
         mr_buffers[i] = ctx->registerMemory(buffers[i], SLICE_SIZE);
     }
 
-    // 注意：这里不再创建 stream，而是使用传入的 stream
-
     // =============================================================
-    // Phase 1: Scatter-Reduce
+    // Phase 1: Scatter-Reduce (Object Pool Version)
     // =============================================================
     for (int i = 0; i < size - 1; ++i) {
         int send_idx = (rank - i + size) % size;
@@ -59,7 +56,9 @@ void allreduce(float* data, int count, std::shared_ptr<Context> ctx, cudaStream_
         int num_slices = (chunk_bytes + SLICE_SIZE - 1) / SLICE_SIZE;
 
         size_t slice_0_bytes = std::min(SLICE_SIZE, chunk_bytes);
-        auto req_recv_next = ctx->transport()->irecv(recv_from, mr_buffers[0], 0, slice_0_bytes);
+        
+        // 1. Pre-recv Slice 0
+        Request* req_recv_next = ctx->transport()->irecv(recv_from, mr_buffers[0], 0, slice_0_bytes);
 
         for (int s = 0; s < num_slices; ++s) {
             size_t current_slice_bytes = std::min(SLICE_SIZE, chunk_bytes - s * SLICE_SIZE);
@@ -68,29 +67,36 @@ void allreduce(float* data, int count, std::shared_ptr<Context> ctx, cudaStream_
             int curr_buff_idx = s % 2;
             int next_buff_idx = (s + 1) % 2;
 
-            std::shared_ptr<Request> req_recv_future = nullptr;
+            Request* req_recv_future = nullptr;
             if (s < num_slices - 1) {
                 size_t next_slice_bytes = std::min(SLICE_SIZE, chunk_bytes - (s + 1) * SLICE_SIZE);
                 req_recv_future = ctx->transport()->irecv(recv_from, mr_buffers[next_buff_idx], 0, next_slice_bytes);
             }
 
-            auto req_send = ctx->transport()->isend(send_to, mr_data, block_send_offset + s * SLICE_SIZE, current_slice_bytes);
+            Request* req_send = ctx->transport()->isend(send_to, mr_data, block_send_offset + s * SLICE_SIZE, current_slice_bytes);
 
+            // Wait current recv
             req_recv_next->wait();
+            
+            // --- 👇 关键点: 用完即还 ---
+            req_recv_next->release(); 
 
-            // 计算：使用用户传入的 stream
+            // Compute
             float* d_target = data + (recv_idx * chunk_count) + (s * ELEMS_PER_SLICE);
             launch_cuda_kernel(d_target, buffers[curr_buff_idx], d_target, current_slice_elems, stream);
 
+            // Wait send
             req_send->wait();
+            req_send->release(); // --- 👇 关键点: 用完即还 ---
+
+            // Move pointer
             req_recv_next = req_recv_future;
         }
-        // 同步用户流，确保下一轮 Ring 数据安全
         checkCuda(cudaStreamSynchronize(stream), "Stream Sync");
     }
 
     // =============================================================
-    // Phase 2: All-Gather
+    // Phase 2: All-Gather (Object Pool Version)
     // =============================================================
     for (int i = 0; i < size - 1; ++i) {
         int send_idx = (rank - i + 1 + size) % size;
@@ -101,10 +107,16 @@ void allreduce(float* data, int count, std::shared_ptr<Context> ctx, cudaStream_
 
         for (int s = 0; s < num_slices; ++s) {
             size_t current_slice_bytes = std::min(SLICE_SIZE, chunk_bytes - s * SLICE_SIZE);
-            auto req_recv = ctx->transport()->irecv(recv_from, mr_data, block_recv_offset + s * SLICE_SIZE, current_slice_bytes);
-            auto req_send = ctx->transport()->isend(send_to, mr_data, block_send_offset + s * SLICE_SIZE, current_slice_bytes);
+            
+            Request* req_recv = ctx->transport()->irecv(recv_from, mr_data, block_recv_offset + s * SLICE_SIZE, current_slice_bytes);
+            Request* req_send = ctx->transport()->isend(send_to, mr_data, block_send_offset + s * SLICE_SIZE, current_slice_bytes);
+            
             req_recv->wait();
             req_send->wait();
+            
+            // --- 👇 释放资源 ---
+            req_recv->release();
+            req_send->release();
         }
     }
 

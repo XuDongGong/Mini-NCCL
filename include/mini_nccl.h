@@ -51,13 +51,12 @@ class Context;
 class Request {
 public:
     virtual ~Request() = default;
-    
-    // 阻塞等待操作完成
-    // 如果通信失败，这里应该抛出异常
     virtual void wait() = 0;
-    
-    // 检查是否完成 (非阻塞)
     virtual bool isCompleted() const = 0;
+    
+    // 归还对象到资源池
+    // 类似于 delete this，但实际上只是回收到池子里
+    virtual void release() = 0;
 };
 
 /**
@@ -71,24 +70,18 @@ public:
     // 初始化传输层 (例如建立 QP 连接，或者 TCP 握手)
     virtual void init() = 0;
 
-    // 核心接口：发送数据 (非阻塞)
-    // rank: 目标节点的 ID
-    // mr: 已经注册好的内存区域
-    // offset: 内存区域内的偏移量
-    // length: 发送长度
-    virtual std::shared_ptr<Request> isend(int rank, 
-                                           std::shared_ptr<MemoryRegion> mr, 
-                                           size_t offset, 
-                                           size_t length) = 0;
+    // 返回值从 std::shared_ptr<Request> 改为 Request*
+    // 含义：Caller 借用这个对象，用完必须调用 req->release() 归还
+    virtual Request* isend(int rank, 
+                           std::shared_ptr<MemoryRegion> mr, 
+                           size_t offset, 
+                           size_t length) = 0;
 
-    // 核心接口：接收数据 (非阻塞)
-    // rank: 来源节点的 ID
-    virtual std::shared_ptr<Request> irecv(int rank, 
-                                           std::shared_ptr<MemoryRegion> mr, 
-                                           size_t offset, 
-                                           size_t length) = 0;
+    virtual Request* irecv(int rank, 
+                           std::shared_ptr<MemoryRegion> mr, 
+                           size_t offset, 
+                           size_t length) = 0;
     
-    // 注册内存 (将普通指针变成 RDMA 可用的 MR)
     virtual std::shared_ptr<MemoryRegion> registerMemory(void* ptr, size_t size) = 0;
 };
 
