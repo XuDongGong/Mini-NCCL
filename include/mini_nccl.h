@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include <cuda_runtime.h>
 #include <vector>
 #include <memory>
 #include <string>
@@ -131,6 +132,6 @@ private:
  * count: 元素个数，不是字节数
  * ctx: 上下文
  */
-void allreduce(float* data, int count, std::shared_ptr<Context> ctx);
+void allreduce(float* data, int count, std::shared_ptr<Context> ctx, cudaStream_t stream);
 
 } // namespace mini_nccl
