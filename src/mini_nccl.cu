@@ -20,12 +20,12 @@ void checkCuda(cudaError_t result, const char* msg) {
     }
 }
 
-// 核心算法：Ring All-Reduce
+// 算法：Ring All-Reduce
 void allreduce(float* data, int count, std::shared_ptr<Context> ctx) {
     int rank = ctx->rank();
     int size = ctx->size();
     
-    // 如果只有一个人，直接返回
+    // 如果只有一个，直接返回
     if (size == 1) return;
 
     // 1. 计算分块大小
@@ -41,8 +41,7 @@ void allreduce(float* data, int count, std::shared_ptr<Context> ctx) {
     int recv_from = (rank - 1 + size) % size; // 左边
     int send_to   = (rank + 1) % size;        // 右边
 
-    // 3. 注册内存 (整个 data 数组)
-    // 注意：RDMA 需要注册整个缓冲区
+    // 3. 注册内存 (整个 data 数组),RDMA 需要注册整个缓冲区
     auto mr = ctx->registerMemory(data, count * sizeof(float));
 
     // 4. 准备 GPU 上的临时缓冲区 (用于接收左边发来的数据)
@@ -52,7 +51,7 @@ void allreduce(float* data, int count, std::shared_ptr<Context> ctx) {
     // 但是 RDMA 必须收数据到注册内存。
     // 简单起见，我们在 data 后面（或者是另外分配的一块注册内存）作为 buffer。
     // 为了不破坏接口，我们假设 data 已经在 GPU 上了。
-    // 等等！Soft-RoCE 不能直接访问 GPU 显存。
+    // Soft-RoCE 不能直接访问 GPU 显存。
     // 我们之前的 Demo 01 是用 cudaHostAlloc (CPU Pinned Memory)。
     // 这里的 `data` 指针，用户传进来的如果是 GPU 指针，Soft-RoCE 会挂。
     
@@ -97,10 +96,9 @@ void allreduce(float* data, int count, std::shared_ptr<Context> ctx) {
         float* d_source = recv_buffer;
         
         // 启动 GPU 核函数进行加法
-        // 注意：虽然内存在 CPU 上，但因为是 Pinned，GPU 也可以访问 (Zero-Copy)
+        // 虽然内存在 CPU 上，但因为是 Pinned，GPU 也可以访问 (Zero-Copy)
         // 实际上为了速度，应该 cudaMemcpy 到 Device 算完再拷回，或者 data 本身就在 Device (需 GPUDirect)。
-        // 这里为了兼容 Demo 01 环境，我们用最简单的方式：CPU 上算！
-        // 哎呀，如果用 GPU 核函数，还得配置 stream。
+        // 这里为了兼容 Demo 01 环境，我们用最简单的方式：CPU 上算。
         // Demo 01 里我们是 cudaMemcpy 进 GPU 算的。
         // 这里简化：直接用 CPU 算 (模拟 GPU)，因为数据本身就在 Host Memory。
         // 这样代码更简洁，专注验证 RDMA Ring 逻辑。

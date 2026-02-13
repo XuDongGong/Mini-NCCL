@@ -37,7 +37,7 @@ private:
     struct ibv_mr* mr_;
 };
 
-class RDMATransport; // Forward decl
+class RDMATransport;
 
 // RDMA 请求对象：用于追踪 isend/irecv 的状态
 class RDMARequest : public Request {
@@ -69,14 +69,11 @@ public:
     }
 
     ~RDMATransport() {
-        // 清理资源... (略，保持之前的逻辑)
+        // 清理资源...
     }
 
-    // 复用之前的 init 逻辑 (这里为了节省篇幅简写，请保留你之前文件中完整的 init 实现!)
-    // *** 核心：请确保这里是你上一步提交的完整 init 代码 ***
+    // 复用之前的 init 逻辑
     void init() override {
-        // ... (此处代码与上一步完全一致，请保留原样) ...
-        // 为了方便，我在下面完整写出来，确保你不小心删掉
         create_qps();
         exchange_and_connect(); 
     }
@@ -179,11 +176,6 @@ private:
     uint64_t next_wr_id_ = 0;
     std::unordered_set<uint64_t> completed_ids_; // 已完成的任务ID池
 
-    // ... (保留 setup_device, create_qp, connect_qp 等私有辅助函数) ...
-    // 为了代码简洁，请把上一步写好的辅助函数都贴在这里
-    // 必须保留的辅助函数：setup_device, create_qp, connect_qp
-    
-    // --- 辅助函数重新粘贴区 (方便你复制) ---
     void setup_device() {
         int num_devices;
         struct ibv_device** dev_list = ibv_get_device_list(&num_devices);
@@ -217,11 +209,6 @@ private:
     }
 
     void exchange_and_connect() {
-        // ... 把上一步 init() 中从 "准备好我自己的名片" 到 "End" 的代码贴在这里 ...
-        // 由于篇幅限制，这里用伪代码指代，请务必把上一版 init() 里的 TCP 握手逻辑拷过来
-        // 如果需要我完整重写这一段，请告诉我。
-        // 简单策略：直接把上一步 init() 函数体里的内容，除了第一步 create_qp，剩下的全放这里。
-        
         // 1. Query Port & GID
         struct ibv_port_attr port_attr;
         ibv_query_port(ctx_, 1, &port_attr);
