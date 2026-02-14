@@ -6,13 +6,14 @@
 #include <cfloat> 
 #include <chrono> 
 #include <thread> 
-#include <queue> // New for request window
+#include <queue> 
+#include <string>
 
 namespace mini_nccl {
 
 const size_t SLICE_SIZE = 128 * 1024; 
-const int WINDOW_SIZE = 64;   // Max in-flight signaled requests
-const int SIGNAL_BATCH = 16;  // Signal every 16 ops
+const int WINDOW_SIZE = 64;   
+const int SIGNAL_BATCH = 16;  
 
 __global__ void wait_kernel(volatile uint32_t* flag_addr, uint32_t expected, volatile uint32_t* abort_flag) {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
@@ -40,10 +41,11 @@ __global__ void elementwise_reduce_kernel(const T* __restrict__ a, const T* __re
     if (i < n) c[i] = op(a[i], b[i]);
 }
 
+// Step 3.1: 替换 exit(1) 为 throw exception
 void checkCuda(cudaError_t result, const char* msg) {
     if (result != cudaSuccess) {
-        std::cerr << "CUDA Error: " << msg << " : " << cudaGetErrorString(result) << std::endl;
-        exit(1);
+        std::string err_str = "CUDA Error: " + std::string(msg) + " : " + std::string(cudaGetErrorString(result));
+        throw std::runtime_error(err_str);
     }
 }
 
@@ -84,7 +86,6 @@ void allreduce_impl(T* data, int count, Op op, std::shared_ptr<Context> ctx, cud
     volatile uint32_t* d_flags = transport->get_flags_ptr();
     volatile uint32_t* d_abort_flag = transport->get_abort_flag_dev_ptr();
 
-    // Step 2.2: 流控窗口 (只追踪 Signaled Requests)
     std::queue<Request*> pending_reqs;
 
     // ================= Phase 1: Scatter-Reduce =================
@@ -99,8 +100,6 @@ void allreduce_impl(T* data, int count, Op op, std::shared_ptr<Context> ctx, cud
             int current_slice_elems = current_slice_bytes / type_size;
             int curr_buff_idx = s % 2; 
             
-            // 是否产生完成信号？(每16个切片一次，或最后一个切片)
-            // 注意：最后一个 Slice 必须 Signal，否则可能永远无法确认完成
             bool do_signal = ((s % SIGNAL_BATCH) == 0) || (s == num_slices - 1);
 
             wait_kernel<<<1, 1, 0, stream>>>(&d_flags[curr_buff_idx], signal_seq, d_abort_flag);
@@ -120,17 +119,12 @@ void allreduce_impl(T* data, int count, Op op, std::shared_ptr<Context> ctx, cud
                 uint64_t remote_dst_addr = send_peer_info.buffer_addr[s % 2];
                 uint32_t remote_rkey = send_peer_info.buffer_rkey[s % 2];
                 
-                // Write Data (Unsignaled usually)
                 Request* req_write = transport->write(send_to, mr_data, block_send_offset + s * SLICE_SIZE, current_slice_bytes, 
-                                                    remote_dst_addr, remote_rkey, false); // Data Write 从不 Signal，节省 CQ
+                                                    remote_dst_addr, remote_rkey, false);
                 
-                // Write Signal (Selective Signal)
-                // 只有 Signal Write 需要确认，因为它标志着数据已到达
                 Request* req_sig = transport->write_signal(send_to, curr_buff_idx, signal_seq, do_signal);
                 
                 if (req_sig) pending_reqs.push(req_sig);
-                
-                // 窗口回收：如果堆积太多，等待最老的一个
                 if (pending_reqs.size() > WINDOW_SIZE) {
                     Request* oldest = pending_reqs.front();
                     oldest->wait(); oldest->release();
@@ -142,7 +136,6 @@ void allreduce_impl(T* data, int count, Op op, std::shared_ptr<Context> ctx, cud
     }
     
     // ================= Phase 2: All-Gather =================
-    // 清空 Phase 1 的残留请求 (保险起见)
     while(!pending_reqs.empty()) {
         pending_reqs.front()->wait(); pending_reqs.front()->release(); pending_reqs.pop();
     }
@@ -184,7 +177,6 @@ void allreduce_impl(T* data, int count, Op op, std::shared_ptr<Context> ctx, cud
         }
     }
 
-    // 最终清空 Phase 2 的请求
     while(!pending_reqs.empty()) {
         pending_reqs.front()->wait(); pending_reqs.front()->release(); pending_reqs.pop();
     }
@@ -222,7 +214,9 @@ void allreduce(void* data, int count, DataType dtype, RedOp op, std::shared_ptr<
         case DataType::Float32: DISPATCH_OP(float, dtype, ctx, stream); break;
         case DataType::Float64: DISPATCH_OP(double, dtype, ctx, stream); break;
         case DataType::Int32:   DISPATCH_OP(int, dtype, ctx, stream); break;
-        default: std::cerr << "Unknown DataType!" << std::endl; exit(1);
+        default: 
+            // Step 3.1: 替换 exit(1) 为 throw exception
+            throw std::runtime_error("Unknown DataType!");
     }
 }
 

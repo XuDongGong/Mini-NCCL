@@ -12,10 +12,10 @@
 #include <unordered_set>
 #include <unistd.h> 
 #include <atomic> 
+#include <string>
 
 namespace mini_nccl {
 
-// 用于在 TCP 上交换的临时结构
 struct DynamicMemInfo {
     int rank;
     uint64_t data_addr; uint32_t data_rkey;
@@ -31,13 +31,9 @@ struct RdmaInfo {
     uint32_t qp_num;
     uint16_t lid;
     uint8_t gid[16];
-    
-    // 静态信息 (Flags)
     uint64_t flag_addr; uint32_t flag_rkey;
     uint64_t host_hash;             
     cudaIpcMemHandle_t flag_ipc;    
-
-    // 动态信息 (Data & Buffers)
     uint64_t data_addr; uint32_t data_rkey;
     uint64_t buffer_addr[2]; uint32_t buffer_rkey[2];
     cudaIpcMemHandle_t data_ipc;    
@@ -103,11 +99,14 @@ public:
         gethostname(hostname, 1024);
         my_host_hash_ = std::hash<std::string>{}(std::string(hostname));
         
-        cudaHostAlloc(&abort_flag_, sizeof(uint32_t), cudaHostAllocMapped);
+        if (cudaHostAlloc(&abort_flag_, sizeof(uint32_t), cudaHostAllocMapped) != cudaSuccess)
+            throw std::runtime_error("Failed to alloc abort_flag");
         *abort_flag_ = 0; 
 
         size_t flag_size = 1024 * sizeof(uint32_t);
-        cudaHostAlloc(&flags_, flag_size, cudaHostAllocMapped);
+        if (cudaHostAlloc(&flags_, flag_size, cudaHostAllocMapped) != cudaSuccess)
+            throw std::runtime_error("Failed to alloc flags");
+            
         mr_flags_ = ibv_reg_mr(pd_, flags_, flag_size, 
             IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
         memset(flags_, 0, flag_size);
@@ -121,6 +120,20 @@ public:
         if (cq_) ibv_destroy_cq(cq_);
         if (pd_) ibv_dealloc_pd(pd_);
         if (ctx_) ibv_close_device(ctx_);
+        
+        // Step 3.2: 安全回收所有 IPC 句柄
+        for (auto& pair : peer_ipc_ptrs_) {
+            if (pair.second.is_local) {
+                // 关闭静态 Flag 句柄
+                if (pair.second.flag_ptr) cudaIpcCloseMemHandle(pair.second.flag_ptr);
+                // 关闭最后一次 AllReduce 遗留的动态句柄
+                if (pair.second.data_ptr) cudaIpcCloseMemHandle(pair.second.data_ptr);
+                if (pair.second.buffer_ptr[0]) cudaIpcCloseMemHandle(pair.second.buffer_ptr[0]);
+                if (pair.second.buffer_ptr[1]) cudaIpcCloseMemHandle(pair.second.buffer_ptr[1]);
+            }
+        }
+        // 防止析构时抛出异常或残留错误
+        cudaGetLastError(); 
     }
 
     void init() override {
@@ -131,7 +144,9 @@ public:
     uint32_t* get_flags_ptr() override { 
         uint32_t* d_ptr = nullptr;
         cudaError_t err = cudaHostGetDevicePointer(&d_ptr, flags_, 0);
-        if (err != cudaSuccess) exit(1); 
+        if (err != cudaSuccess) {
+            throw std::runtime_error("get_flags_ptr failed: " + std::string(cudaGetErrorString(err)));
+        }
         return d_ptr;
     }
 
@@ -160,7 +175,6 @@ public:
         void* d_ptr = nullptr;
         cudaError_t ret = cudaSuccess;
 
-        // Data Handle
         ret = cudaHostGetDevicePointer(&d_ptr, raw_data_ptr, 0);
         if (ret != cudaSuccess) { cudaGetLastError(); memset(&my_dyn.data_ipc, 0, sizeof(my_dyn.data_ipc)); } 
         else {
@@ -168,7 +182,6 @@ public:
             if (ret != cudaSuccess) { cudaGetLastError(); memset(&my_dyn.data_ipc, 0, sizeof(my_dyn.data_ipc)); }
         }
         
-        // Buf0 Handle
         ret = cudaHostGetDevicePointer(&d_ptr, raw_buf0_ptr, 0);
         if (ret != cudaSuccess) { cudaGetLastError(); memset(&my_dyn.buf0_ipc, 0, sizeof(my_dyn.buf0_ipc)); } 
         else {
@@ -176,7 +189,6 @@ public:
             if (ret != cudaSuccess) { cudaGetLastError(); memset(&my_dyn.buf0_ipc, 0, sizeof(my_dyn.buf0_ipc)); }
         }
         
-        // Buf1 Handle
         ret = cudaHostGetDevicePointer(&d_ptr, raw_buf1_ptr, 0);
         if (ret != cudaSuccess) { cudaGetLastError(); memset(&my_dyn.buf1_ipc, 0, sizeof(my_dyn.buf1_ipc)); } 
         else {
@@ -210,6 +222,15 @@ public:
             peer_infos_[i].buffer_rkey[1] = all_dyn[i].buf1_rkey;
             
             if (peer_ipc_ptrs_[i].is_local) {
+                // Step 3.2: 在打开新句柄前，先关闭旧的动态句柄
+                // 防止资源泄漏 (flags_ipc 是静态的，不用关)
+                if (peer_ipc_ptrs_[i].data_ptr) { cudaIpcCloseMemHandle(peer_ipc_ptrs_[i].data_ptr); peer_ipc_ptrs_[i].data_ptr = nullptr; }
+                if (peer_ipc_ptrs_[i].buffer_ptr[0]) { cudaIpcCloseMemHandle(peer_ipc_ptrs_[i].buffer_ptr[0]); peer_ipc_ptrs_[i].buffer_ptr[0] = nullptr; }
+                if (peer_ipc_ptrs_[i].buffer_ptr[1]) { cudaIpcCloseMemHandle(peer_ipc_ptrs_[i].buffer_ptr[1]); peer_ipc_ptrs_[i].buffer_ptr[1] = nullptr; }
+                
+                // 确保 Close 操作没有留下脏状态
+                cudaGetLastError();
+
                 cudaError_t ipc_err = cudaSuccess;
                 void* d_data = nullptr;
                 void* d_buf0 = nullptr;
@@ -231,11 +252,10 @@ public:
         }
     }
 
-    // Step 2.1: 增加 signaled 参数，默认 true
     Request* write(int rank, std::shared_ptr<MemoryRegion> local_mr, size_t offset, size_t length,
                    uint64_t remote_addr, uint32_t remote_rkey, bool signaled = true) override {
         auto rmr = std::static_pointer_cast<RDMAMemoryRegion>(local_mr);
-        uint64_t wr_id = next_wr_id_++; // WR ID 依然递增，方便调试
+        uint64_t wr_id = next_wr_id_++; 
         struct ibv_sge sge;
         sge.addr = (uint64_t)rmr->ptr() + offset;
         sge.length = length;
@@ -247,14 +267,13 @@ public:
         wr.num_sge = 1;
         wr.opcode = IBV_WR_RDMA_WRITE;
         wr.send_flags = 0;
-        if (signaled) wr.send_flags |= IBV_SEND_SIGNALED; // Selective Signaling
+        if (signaled) wr.send_flags |= IBV_SEND_SIGNALED; 
         wr.wr.rdma.remote_addr = remote_addr;
         wr.wr.rdma.rkey = remote_rkey;
 
         struct ibv_send_wr* bad_wr;
         if (ibv_post_send(qps_[rank], &wr, &bad_wr)) throw std::runtime_error("ibv_post_send (WRITE) failed");
         
-        // 如果不 Signal，就没法 wait，也不需要 Request 对象
         if (!signaled) return nullptr;
         return allocateRequest(wr_id);
     }
@@ -267,7 +286,7 @@ public:
         struct ibv_send_wr wr = {};
         wr.wr_id = wr_id;
         wr.opcode = IBV_WR_RDMA_WRITE;
-        wr.send_flags = IBV_SEND_INLINE; // Signal 小包必须 Inline 保证性能
+        wr.send_flags = IBV_SEND_INLINE; 
         if (signaled) wr.send_flags |= IBV_SEND_SIGNALED;
         
         struct ibv_sge sge;
@@ -384,8 +403,16 @@ private:
         union ibv_gid my_gid;
         ibv_query_gid(ctx_, 1, 1, &my_gid);
         
-        void* d_flag; cudaHostGetDevicePointer(&d_flag, flags_, 0);
-        cudaIpcGetMemHandle(&my_flag_ipc_, d_flag);
+        void* d_flag; 
+        if (cudaHostGetDevicePointer(&d_flag, flags_, 0) != cudaSuccess)
+            throw std::runtime_error("Failed to get device ptr for flags");
+            
+        // 关键修复：允许失败，软降级
+        if (cudaIpcGetMemHandle(&my_flag_ipc_, d_flag) != cudaSuccess) {
+            cudaGetLastError(); // 吞掉错误
+            memset(&my_flag_ipc_, 0, sizeof(my_flag_ipc_)); // 置零
+            // 此时 my_flag_ipc_ 无效，对端 map 会失败，然后自动降级 RDMA。符合预期。
+        }
 
         std::vector<RdmaInfo> my_infos;
         for (int i = 0; i < nRanks_; ++i) {
