@@ -10,6 +10,7 @@
 #include <iostream>
 #include <algorithm>
 #include <unordered_set>
+#include <unistd.h> // for gethostname
 
 namespace mini_nccl {
 
@@ -18,13 +19,17 @@ struct RdmaInfo {
     uint32_t qp_num;
     uint16_t lid;
     uint8_t gid[16];
-    uint64_t flag_addr;
-    uint32_t flag_rkey;
-    uint64_t data_addr; 
-    uint32_t data_rkey;
-    // 新增：双缓冲的地址和 RKey
-    uint64_t buffer_addr[2];
-    uint32_t buffer_rkey[2];
+    
+    // RDMA 信息
+    uint64_t flag_addr; uint32_t flag_rkey;
+    uint64_t data_addr; uint32_t data_rkey;
+    uint64_t buffer_addr[2]; uint32_t buffer_rkey[2];
+
+    // Phase 7: 拓扑与 IPC 信息
+    uint64_t host_hash;             // 用于判断是否在同一节点
+    cudaIpcMemHandle_t flag_ipc;    // 信号内存句柄
+    cudaIpcMemHandle_t data_ipc;    // 数据内存句柄
+    cudaIpcMemHandle_t buffer_ipc[2];// 双缓冲句柄
 };
 
 class RDMAMemoryRegion : public MemoryRegion {
@@ -65,16 +70,28 @@ private:
     int pool_idx_; 
 };
 
+// Phase 7: 定义 IPC 指针包
+struct PeerIpcPtrs {
+    bool is_local = false;
+    void* flag_ptr = nullptr;
+    void* data_ptr = nullptr;
+    void* buffer_ptr[2] = {nullptr, nullptr};
+};
+
 class RDMATransport : public Transport {
 public:
     RDMATransport(int rank, int nRanks, std::string root_ip = "127.0.0.1") 
         : rank_(rank), nRanks_(nRanks), root_ip_(root_ip) {
 
-        // 必须在任何 CUDA 调用前设置
         cudaSetDeviceFlags(cudaDeviceMapHost);
         
         setup_device();
         init_memory_pool();
+        
+        // 计算 Host Hash
+        char hostname[1024];
+        gethostname(hostname, 1024);
+        my_host_hash_ = std::hash<std::string>{}(std::string(hostname));
         
         size_t flag_size = 1024 * sizeof(uint32_t);
         cudaHostAlloc(&flags_, flag_size, cudaHostAllocMapped);
@@ -84,6 +101,8 @@ public:
     }
 
     ~RDMATransport() {
+        // 关闭 IPC 句柄 (这里简化，实际上应该 cudaIpcCloseMemHandle)
+        // 但对于 cudaHostAlloc 映射的指针，通常不需要显式 close
         if (mr_flags_) ibv_dereg_mr(mr_flags_);
         if (flags_) cudaFreeHost(flags_);
         for (auto& pair : qps_) if (pair.second) ibv_destroy_qp(pair.second);
@@ -100,17 +119,18 @@ public:
     uint32_t* get_flags_ptr() override { 
         uint32_t* d_ptr = nullptr;
         cudaError_t err = cudaHostGetDevicePointer(&d_ptr, flags_, 0);
-        if (err != cudaSuccess) {
-            std::cerr << "CUDA Error in get_flags_ptr: " << cudaGetErrorString(err) << std::endl;
-            exit(1); 
-        }
+        if (err != cudaSuccess) exit(1); 
         return d_ptr;
     }
 
     RdmaInfo get_peer_info(int rank) { return peer_infos_[rank]; }
 
+    // Phase 7: 获取 Peer 的 IPC 指针
+    PeerIpcPtrs get_peer_ipc_ptrs(int rank) { return peer_ipc_ptrs_[rank]; }
+
     Request* write(int rank, std::shared_ptr<MemoryRegion> local_mr, size_t offset, size_t length,
                    uint64_t remote_addr, uint32_t remote_rkey) override {
+        // 传统的 RDMA Write，供非 Local 或 IPC 失败时使用
         auto rmr = std::static_pointer_cast<RDMAMemoryRegion>(local_mr);
         uint64_t wr_id = next_wr_id_++;
         struct ibv_sge sge;
@@ -133,6 +153,7 @@ public:
     }
 
     Request* write_signal(int rank, int flag_idx, uint32_t value) override {
+        // 同样，这是 RDMA 路径
         uint64_t wr_id = next_wr_id_++;
         uint64_t remote_addr = peer_infos_[rank].flag_addr + flag_idx * sizeof(uint32_t);
         uint32_t rkey = peer_infos_[rank].flag_rkey;
@@ -185,16 +206,34 @@ public:
 
     friend class RDMARequest;
 
-    // Phase 6: 设置本地信息 (Data + Buffer)
     void set_local_mem_info(uint64_t data_addr, uint32_t data_rkey,
                             uint64_t buf0_addr, uint32_t buf0_rkey,
-                            uint64_t buf1_addr, uint32_t buf1_rkey) {
+                            uint64_t buf1_addr, uint32_t buf1_rkey,
+                            void* raw_data_ptr, void* raw_buf0_ptr, void* raw_buf1_ptr) { // 需要原始指针来生成 IPC
         my_data_addr_ = data_addr;
         my_data_rkey_ = data_rkey;
         my_buffer_addrs_[0] = buf0_addr;
         my_buffer_rkeys_[0] = buf0_rkey;
         my_buffer_addrs_[1] = buf1_addr;
         my_buffer_rkeys_[1] = buf1_rkey;
+
+        // 生成 IPC 句柄 (注意：必须是 Device Pointer，如果是 HostAlloc，先 GetDevicePtr)
+        // 这里的 raw_ptr 应该是 Context registerMemory 传进来的，通常是 Host 指针
+        // 对于 cudaHostAlloc，需要获取 Device Pointer 才能做 IPC (或者直接 IPC Host Pointer，视版本而定)
+        // 稳妥起见，我们对 data 获取 DevicePtr
+        
+        void* d_data; cudaHostGetDevicePointer(&d_data, raw_data_ptr, 0);
+        cudaIpcGetMemHandle(&my_data_ipc_, d_data);
+        
+        void* d_buf0; cudaHostGetDevicePointer(&d_buf0, raw_buf0_ptr, 0);
+        cudaIpcGetMemHandle(&my_buffer_ipc_[0], d_buf0);
+
+        void* d_buf1; cudaHostGetDevicePointer(&d_buf1, raw_buf1_ptr, 0);
+        cudaIpcGetMemHandle(&my_buffer_ipc_[1], d_buf1);
+        
+        // Flag 也是
+        void* d_flag; cudaHostGetDevicePointer(&d_flag, flags_, 0);
+        cudaIpcGetMemHandle(&my_flag_ipc_, d_flag);
     }
 
 private:
@@ -209,12 +248,18 @@ private:
     uint32_t* flags_ = nullptr;
     struct ibv_mr* mr_flags_ = nullptr;
     std::map<int, RdmaInfo> peer_infos_; 
+    std::map<int, PeerIpcPtrs> peer_ipc_ptrs_; // 存储打开后的远程指针
 
     // 本地信息
+    uint64_t my_host_hash_;
     uint64_t my_data_addr_ = 0;
     uint32_t my_data_rkey_ = 0;
     uint64_t my_buffer_addrs_[2] = {0, 0};
     uint32_t my_buffer_rkeys_[2] = {0, 0};
+    
+    cudaIpcMemHandle_t my_data_ipc_;
+    cudaIpcMemHandle_t my_buffer_ipc_[2];
+    cudaIpcMemHandle_t my_flag_ipc_;
 
     uint64_t next_wr_id_ = 0;
     std::unordered_set<uint64_t> completed_ids_;
@@ -266,17 +311,31 @@ private:
         std::vector<RdmaInfo> my_infos;
         for (int i = 0; i < nRanks_; ++i) {
             if (i == rank_) {
-                // 占位
-                my_infos.push_back({rank_, 0, 0, {0}, 0, 0, 0, 0, {0,0}, {0,0}});
+                my_infos.push_back({}); // 占位
             } else {
-                my_infos.push_back({
-                    rank_, qps_[i]->qp_num, port_attr.lid, {0}, 
-                    (uint64_t)flags_, mr_flags_->rkey,
-                    my_data_addr_, my_data_rkey_,
-                    {my_buffer_addrs_[0], my_buffer_addrs_[1]},
-                    {my_buffer_rkeys_[0], my_buffer_rkeys_[1]}
-                });
-                memcpy(my_infos.back().gid, my_gid.raw, 16);
+                RdmaInfo info;
+                info.rank = rank_;
+                info.qp_num = qps_[i]->qp_num;
+                info.lid = port_attr.lid;
+                memcpy(info.gid, my_gid.raw, 16);
+                
+                info.flag_addr = (uint64_t)flags_;
+                info.flag_rkey = mr_flags_->rkey;
+                info.data_addr = my_data_addr_;
+                info.data_rkey = my_data_rkey_;
+                info.buffer_addr[0] = my_buffer_addrs_[0];
+                info.buffer_rkey[0] = my_buffer_rkeys_[0];
+                info.buffer_addr[1] = my_buffer_addrs_[1];
+                info.buffer_rkey[1] = my_buffer_rkeys_[1];
+
+                // Phase 7
+                info.host_hash = my_host_hash_;
+                info.flag_ipc = my_flag_ipc_;
+                info.data_ipc = my_data_ipc_;
+                info.buffer_ipc[0] = my_buffer_ipc_[0];
+                info.buffer_ipc[1] = my_buffer_ipc_[1];
+                
+                my_infos.push_back(info);
             }
         }
         
@@ -311,6 +370,29 @@ private:
             if (i == rank_) continue;
             peer_infos_[i] = global_registry[i][rank_]; 
             connect_qp(qps_[i], peer_infos_[i]);
+
+            // Phase 7: 拓扑探测与 IPC 映射
+            PeerIpcPtrs ipc_ptrs;
+            ipc_ptrs.is_local = false;
+
+            if (peer_infos_[i].host_hash == my_host_hash_) {
+                std::cout << "[Topo] Rank " << i << " is LOCAL (Same Node). Trying IPC..." << std::endl;
+                // 尝试打开 IPC 句柄
+                cudaError_t err;
+                
+                err = cudaIpcOpenMemHandle(&ipc_ptrs.flag_ptr, peer_infos_[i].flag_ipc, cudaIpcMemLazyEnablePeerAccess);
+                if(err == cudaSuccess) {
+                    cudaIpcOpenMemHandle(&ipc_ptrs.data_ptr, peer_infos_[i].data_ipc, cudaIpcMemLazyEnablePeerAccess);
+                    cudaIpcOpenMemHandle(&ipc_ptrs.buffer_ptr[0], peer_infos_[i].buffer_ipc[0], cudaIpcMemLazyEnablePeerAccess);
+                    cudaIpcOpenMemHandle(&ipc_ptrs.buffer_ptr[1], peer_infos_[i].buffer_ipc[1], cudaIpcMemLazyEnablePeerAccess);
+                    
+                    ipc_ptrs.is_local = true;
+                    std::cout << "[Topo] IPC Mapped Successfully!" << std::endl;
+                } else {
+                    std::cout << "[Topo] IPC Failed: " << cudaGetErrorString(err) << ". Fallback to RDMA." << std::endl;
+                }
+            }
+            peer_ipc_ptrs_[i] = ipc_ptrs;
         }
     }
 
