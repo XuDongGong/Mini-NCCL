@@ -10,7 +10,8 @@
 #include <iostream>
 #include <algorithm>
 #include <unordered_set>
-#include <unistd.h> // for gethostname
+#include <unistd.h> 
+#include <atomic> // for atomic flags if needed
 
 namespace mini_nccl {
 
@@ -26,10 +27,10 @@ struct RdmaInfo {
     uint64_t buffer_addr[2]; uint32_t buffer_rkey[2];
 
     // Phase 7: 拓扑与 IPC 信息
-    uint64_t host_hash;             // 用于判断是否在同一节点
-    cudaIpcMemHandle_t flag_ipc;    // 信号内存句柄
-    cudaIpcMemHandle_t data_ipc;    // 数据内存句柄
-    cudaIpcMemHandle_t buffer_ipc[2];// 双缓冲句柄
+    uint64_t host_hash;             
+    cudaIpcMemHandle_t flag_ipc;    
+    cudaIpcMemHandle_t data_ipc;    
+    cudaIpcMemHandle_t buffer_ipc[2];
 };
 
 class RDMAMemoryRegion : public MemoryRegion {
@@ -70,7 +71,6 @@ private:
     int pool_idx_; 
 };
 
-// Phase 7: 定义 IPC 指针包
 struct PeerIpcPtrs {
     bool is_local = false;
     void* flag_ptr = nullptr;
@@ -93,6 +93,10 @@ public:
         gethostname(hostname, 1024);
         my_host_hash_ = std::hash<std::string>{}(std::string(hostname));
         
+        // Phase 8: 分配 abort_flag (Pinned Memory)
+        cudaHostAlloc(&abort_flag_, sizeof(uint32_t), cudaHostAllocMapped);
+        *abort_flag_ = 0; // 初始化为 0 (正常)
+
         size_t flag_size = 1024 * sizeof(uint32_t);
         cudaHostAlloc(&flags_, flag_size, cudaHostAllocMapped);
         mr_flags_ = ibv_reg_mr(pd_, flags_, flag_size, 
@@ -101,10 +105,9 @@ public:
     }
 
     ~RDMATransport() {
-        // 关闭 IPC 句柄 (这里简化，实际上应该 cudaIpcCloseMemHandle)
-        // 但对于 cudaHostAlloc 映射的指针，通常不需要显式 close
         if (mr_flags_) ibv_dereg_mr(mr_flags_);
         if (flags_) cudaFreeHost(flags_);
+        if (abort_flag_) cudaFreeHost(abort_flag_); // 释放 abort_flag
         for (auto& pair : qps_) if (pair.second) ibv_destroy_qp(pair.second);
         if (cq_) ibv_destroy_cq(cq_);
         if (pd_) ibv_dealloc_pd(pd_);
@@ -123,14 +126,23 @@ public:
         return d_ptr;
     }
 
-    RdmaInfo get_peer_info(int rank) { return peer_infos_[rank]; }
+    // Phase 8: 获取 abort_flag 的 GPU 指针
+    uint32_t* get_abort_flag_dev_ptr() {
+        uint32_t* d_ptr = nullptr;
+        cudaHostGetDevicePointer(&d_ptr, abort_flag_, 0);
+        return d_ptr;
+    }
 
-    // Phase 7: 获取 Peer 的 IPC 指针
+    // Phase 8: CPU 侧触发 Abort
+    void abort() {
+        *abort_flag_ = 1; // 设置为 1，通知 GPU 退出
+    }
+
+    RdmaInfo get_peer_info(int rank) { return peer_infos_[rank]; }
     PeerIpcPtrs get_peer_ipc_ptrs(int rank) { return peer_ipc_ptrs_[rank]; }
 
     Request* write(int rank, std::shared_ptr<MemoryRegion> local_mr, size_t offset, size_t length,
                    uint64_t remote_addr, uint32_t remote_rkey) override {
-        // 传统的 RDMA Write，供非 Local 或 IPC 失败时使用
         auto rmr = std::static_pointer_cast<RDMAMemoryRegion>(local_mr);
         uint64_t wr_id = next_wr_id_++;
         struct ibv_sge sge;
@@ -153,7 +165,6 @@ public:
     }
 
     Request* write_signal(int rank, int flag_idx, uint32_t value) override {
-        // 同样，这是 RDMA 路径
         uint64_t wr_id = next_wr_id_++;
         uint64_t remote_addr = peer_infos_[rank].flag_addr + flag_idx * sizeof(uint32_t);
         uint32_t rkey = peer_infos_[rank].flag_rkey;
@@ -209,18 +220,13 @@ public:
     void set_local_mem_info(uint64_t data_addr, uint32_t data_rkey,
                             uint64_t buf0_addr, uint32_t buf0_rkey,
                             uint64_t buf1_addr, uint32_t buf1_rkey,
-                            void* raw_data_ptr, void* raw_buf0_ptr, void* raw_buf1_ptr) { // 需要原始指针来生成 IPC
+                            void* raw_data_ptr, void* raw_buf0_ptr, void* raw_buf1_ptr) { 
         my_data_addr_ = data_addr;
         my_data_rkey_ = data_rkey;
         my_buffer_addrs_[0] = buf0_addr;
         my_buffer_rkeys_[0] = buf0_rkey;
         my_buffer_addrs_[1] = buf1_addr;
         my_buffer_rkeys_[1] = buf1_rkey;
-
-        // 生成 IPC 句柄 (注意：必须是 Device Pointer，如果是 HostAlloc，先 GetDevicePtr)
-        // 这里的 raw_ptr 应该是 Context registerMemory 传进来的，通常是 Host 指针
-        // 对于 cudaHostAlloc，需要获取 Device Pointer 才能做 IPC (或者直接 IPC Host Pointer，视版本而定)
-        // 稳妥起见，我们对 data 获取 DevicePtr
         
         void* d_data; cudaHostGetDevicePointer(&d_data, raw_data_ptr, 0);
         cudaIpcGetMemHandle(&my_data_ipc_, d_data);
@@ -231,7 +237,6 @@ public:
         void* d_buf1; cudaHostGetDevicePointer(&d_buf1, raw_buf1_ptr, 0);
         cudaIpcGetMemHandle(&my_buffer_ipc_[1], d_buf1);
         
-        // Flag 也是
         void* d_flag; cudaHostGetDevicePointer(&d_flag, flags_, 0);
         cudaIpcGetMemHandle(&my_flag_ipc_, d_flag);
     }
@@ -245,12 +250,14 @@ private:
     struct ibv_cq* cq_ = nullptr;
     std::map<int, struct ibv_qp*> qps_;
     
+    // 信号与 abort
     uint32_t* flags_ = nullptr;
+    uint32_t* abort_flag_ = nullptr; // Phase 8 New
     struct ibv_mr* mr_flags_ = nullptr;
+    
     std::map<int, RdmaInfo> peer_infos_; 
-    std::map<int, PeerIpcPtrs> peer_ipc_ptrs_; // 存储打开后的远程指针
+    std::map<int, PeerIpcPtrs> peer_ipc_ptrs_;
 
-    // 本地信息
     uint64_t my_host_hash_;
     uint64_t my_data_addr_ = 0;
     uint32_t my_data_rkey_ = 0;
@@ -371,13 +378,11 @@ private:
             peer_infos_[i] = global_registry[i][rank_]; 
             connect_qp(qps_[i], peer_infos_[i]);
 
-            // Phase 7: 拓扑探测与 IPC 映射
             PeerIpcPtrs ipc_ptrs;
             ipc_ptrs.is_local = false;
 
             if (peer_infos_[i].host_hash == my_host_hash_) {
                 std::cout << "[Topo] Rank " << i << " is LOCAL (Same Node). Trying IPC..." << std::endl;
-                // 尝试打开 IPC 句柄
                 cudaError_t err;
                 
                 err = cudaIpcOpenMemHandle(&ipc_ptrs.flag_ptr, peer_infos_[i].flag_ipc, cudaIpcMemLazyEnablePeerAccess);
@@ -390,6 +395,8 @@ private:
                     std::cout << "[Topo] IPC Mapped Successfully!" << std::endl;
                 } else {
                     std::cout << "[Topo] IPC Failed: " << cudaGetErrorString(err) << ". Fallback to RDMA." << std::endl;
+                    // 关键：清除这个错误，否则后续的 checkCuda 会读到这个旧错误而误报(增加 cudaGetLastError 清除状态)
+                    cudaGetLastError();
                 }
             }
             peer_ipc_ptrs_[i] = ipc_ptrs;

@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <cuda_runtime.h>
 #include <cfloat> 
+#include <chrono> // for timer
+#include <thread> // for sleep
 
 namespace mini_nccl {
 
@@ -13,25 +15,24 @@ const size_t SLICE_SIZE = 128 * 1024;
 // GPU Kernels
 // =============================================================
 
-// 1. 等待信号 (Polling)
-__global__ void wait_kernel(volatile uint32_t* flag_addr, uint32_t expected) {
+// Phase 8 Update: 增加 abort_flag 检查
+__global__ void wait_kernel(volatile uint32_t* flag_addr, uint32_t expected, volatile uint32_t* abort_flag) {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         while (*flag_addr < expected) {
-            // Spin wait
+            // 每次循环检查一次 abort 信号
+            // 如果主机设置了 abort_flag = 1，立即退出，防止死锁
+            if (*abort_flag != 0) return;
         }
     }
     __syncthreads();
 }
 
-// 2. 发送信号 (IPC Write)
-// Phase 7 新增：通过 IPC 指针直接修改远程 Flag
 __global__ void set_flag_kernel(volatile uint32_t* flag_addr, uint32_t val) {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         *flag_addr = val;
     }
 }
 
-// 3. 计算算子
 template<typename T> struct OpSum { __device__ __forceinline__ T operator()(const T& a, const T& b) const { return a + b; } };
 template<typename T> struct OpProd { __device__ __forceinline__ T operator()(const T& a, const T& b) const { return a * b; } };
 template<typename T> struct OpMax { __device__ __forceinline__ T operator()(const T& a, const T& b) const { return (a > b) ? a : b; } };
@@ -51,7 +52,7 @@ void checkCuda(cudaError_t result, const char* msg) {
 }
 
 // =============================================================
-// Phase 7: Topology-Aware All-Reduce
+// Phase 7 + 8: Topology-Aware & Fault-Tolerant All-Reduce
 // =============================================================
 template<typename T, typename Op>
 void allreduce_impl(T* data, int count, Op op, std::shared_ptr<Context> ctx, cudaStream_t stream) {
@@ -69,7 +70,6 @@ void allreduce_impl(T* data, int count, Op op, std::shared_ptr<Context> ctx, cud
 
     auto mr_data = ctx->registerMemory(data, count * type_size);
 
-    // 1. 分配双缓冲
     T* buffers[2];
     std::shared_ptr<MemoryRegion> mr_buffers[2];
     for(int i=0; i<2; ++i) {
@@ -77,23 +77,23 @@ void allreduce_impl(T* data, int count, Op op, std::shared_ptr<Context> ctx, cud
         mr_buffers[i] = ctx->registerMemory(buffers[i], SLICE_SIZE);
     }
 
-    // 2. 设置本地信息
     transport->set_local_mem_info(
         (uint64_t)mr_data->ptr(), mr_data->rkey(),
         (uint64_t)mr_buffers[0]->ptr(), mr_buffers[0]->rkey(),
         (uint64_t)mr_buffers[1]->ptr(), mr_buffers[1]->rkey(),
-        data, buffers[0], buffers[1] // Phase 7: 传入原始指针用于 IPC
+        data, buffers[0], buffers[1] 
     );
 
-    // 3. 初始化连接 (交换 Hash 和 IPC Handle)
     transport->init(); 
 
-    // 获取发送目标的 RDMA 信息和 IPC 指针
     auto send_peer_info = transport->get_peer_info(send_to);
-    auto send_peer_ipc  = transport->get_peer_ipc_ptrs(send_to); // Phase 7
+    auto send_peer_ipc  = transport->get_peer_ipc_ptrs(send_to);
 
     uint32_t signal_seq = 1; 
     volatile uint32_t* d_flags = transport->get_flags_ptr();
+    
+    // Phase 8: 获取 abort_flag 的 GPU 指针
+    volatile uint32_t* d_abort_flag = transport->get_abort_flag_dev_ptr();
 
     // ================= Phase 1: Scatter-Reduce =================
     for (int i = 0; i < size - 1; ++i) {
@@ -107,53 +107,34 @@ void allreduce_impl(T* data, int count, Op op, std::shared_ptr<Context> ctx, cud
             int current_slice_elems = current_slice_bytes / type_size;
             int curr_buff_idx = s % 2; 
             
-            // 1. [Wait] 等待数据
-            wait_kernel<<<1, 1, 0, stream>>>(&d_flags[curr_buff_idx], signal_seq);
+            // Phase 8: 传入 abort_flag
+            wait_kernel<<<1, 1, 0, stream>>>(&d_flags[curr_buff_idx], signal_seq, d_abort_flag);
 
-            // 2. [Compute] 计算
             T* d_target = data + (recv_idx * chunk_count) + (s * (SLICE_SIZE/type_size));
             int threads = 256;
             int blocks = (current_slice_elems + threads - 1) / threads;
             elementwise_reduce_kernel<<<blocks, threads, 0, stream>>>(d_target, buffers[curr_buff_idx], d_target, current_slice_elems, op);
 
-            // 3. [Push] 发送给右边 (Phase 7 分流)
             if (send_peer_ipc.is_local) {
-                // --- IPC Path (同机极速通道) ---
-                
-                // 3.1 直接 Copy 到对方 Buffer
+                // IPC Path
                 void* remote_buffer = send_peer_ipc.buffer_ptr[s % 2];
-                // 计算源地址：data + offset
                 void* local_src = (char*)data + block_send_offset + s * SLICE_SIZE;
-                
                 checkCuda(cudaMemcpyAsync(remote_buffer, local_src, current_slice_bytes, cudaMemcpyDeviceToDevice, stream), "IPC Memcpy");
-
-                // 3.2 直接写对方 Flag
-                // 注意：flag 指针是 uint32_t*，需要偏移 curr_buff_idx
                 volatile uint32_t* remote_flag = (volatile uint32_t*)send_peer_ipc.flag_ptr + curr_buff_idx;
                 set_flag_kernel<<<1, 1, 0, stream>>>(remote_flag, signal_seq);
-
             } else {
-                // --- RDMA Path (跨机常规通道) ---
-                
-                // 3.1 RDMA Write Buffer
+                // RDMA Path
                 uint64_t remote_dst_addr = send_peer_info.buffer_addr[s % 2];
                 uint32_t remote_rkey = send_peer_info.buffer_rkey[s % 2];
                 Request* req_write = transport->write(send_to, mr_data, block_send_offset + s * SLICE_SIZE, current_slice_bytes, 
                                                     remote_dst_addr, remote_rkey);
-                
-                // 3.2 RDMA Write Signal
                 Request* req_sig = transport->write_signal(send_to, curr_buff_idx, signal_seq);
-
-                // 简单的流控回收
-                if (s % 16 == 0) {
-                    req_write->wait(); req_write->release();
-                    req_sig->wait(); req_sig->release();
-                } else {
-                    req_write->wait(); req_write->release();
-                    req_sig->wait(); req_sig->release();
-                }
+                
+                // 这里我们依然简单 wait request，实际生产中这里也应该异步化
+                // 简单起见，我们假设提交请求很快，瓶颈在 GPU wait
+                req_write->wait(); req_write->release();
+                req_sig->wait(); req_sig->release();
             }
-
             signal_seq++; 
         }
     }
@@ -168,42 +149,58 @@ void allreduce_impl(T* data, int count, Op op, std::shared_ptr<Context> ctx, cud
              size_t current_slice_bytes = std::min(SLICE_SIZE, chunk_bytes - s * SLICE_SIZE);
              int curr_flag_idx = s % 2;
              
-             // 1. [Wait]
-             wait_kernel<<<1, 1, 0, stream>>>(&d_flags[curr_flag_idx], signal_seq);
+             // Phase 8: 传入 abort_flag
+             wait_kernel<<<1, 1, 0, stream>>>(&d_flags[curr_flag_idx], signal_seq, d_abort_flag);
              
-             // 2. [Push]
              if (send_peer_ipc.is_local) {
-                 // --- IPC Path ---
-                 
-                 // 2.1 直接 Copy 到对方 Final Data
-                 // 注意：send_peer_ipc.data_ptr 是对方 data 的基地址，需要加上偏移
                  void* remote_dst = (char*)send_peer_ipc.data_ptr + block_send_offset + s * SLICE_SIZE;
-                 // 源数据在本地 data 的 block_send_offset 处
                  void* local_src = (char*)data + block_send_offset + s * SLICE_SIZE;
-                 
                  checkCuda(cudaMemcpyAsync(remote_dst, local_src, current_slice_bytes, cudaMemcpyDeviceToDevice, stream), "IPC Memcpy Phase2");
-                 
-                 // 2.2 写 Signal
                  volatile uint32_t* remote_flag = (volatile uint32_t*)send_peer_ipc.flag_ptr + curr_flag_idx;
                  set_flag_kernel<<<1, 1, 0, stream>>>(remote_flag, signal_seq);
-                 
              } else {
-                 // --- RDMA Path ---
                  uint64_t remote_dst_addr = send_peer_info.data_addr + block_send_offset + s * SLICE_SIZE;
                  Request* req_write = transport->write(send_to, mr_data, block_send_offset + s * SLICE_SIZE, current_slice_bytes,
                                                      remote_dst_addr, send_peer_info.data_rkey);
-                 
                  Request* req_sig = transport->write_signal(send_to, curr_flag_idx, signal_seq);
-                 
                  req_write->wait(); req_write->release();
                  req_sig->wait(); req_sig->release();
              }
-             
              signal_seq++;
         }
     }
 
-    checkCuda(cudaStreamSynchronize(stream), "Stream Sync");
+    // ================= Phase 8: Watchdog Loop (关键!) =================
+    // 替代 cudaStreamSynchronize(stream);
+    
+    auto start_time = std::chrono::high_resolution_clock::now();
+    const double TIMEOUT_SECONDS = 10.0; // 10秒超时
+
+    while (cudaStreamQuery(stream) == cudaErrorNotReady) {
+        auto now = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double> elapsed = now - start_time;
+        
+        if (elapsed.count() > TIMEOUT_SECONDS) {
+            std::cerr << "[Watchdog] TIMEOUT DETECTED! Aborting GPU kernels..." << std::endl;
+            
+            // 1. 设置 Abort Flag，通知 GPU 退出死循环
+            transport->abort();
+            
+            // 2. 再次等待流，此时 wait_kernel 应该会立即 return
+            // 给它一点时间反应
+            checkCuda(cudaStreamSynchronize(stream), "Stream Sync after Abort");
+            
+            // 3. 抛出异常通知上层
+            throw std::runtime_error("NCCL Watchdog Timeout: Communication hang detected.");
+        }
+        
+        // 避免 CPU 忙等，稍微 sleep 一下
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    
+    // 如果正常结束，确保流没有任何错误
+    checkCuda(cudaGetLastError(), "Final Check");
+
     for(int i=0; i<2; ++i) cudaFreeHost(buffers[i]);
 }
 
