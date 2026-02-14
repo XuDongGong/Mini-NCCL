@@ -21,7 +21,6 @@ struct DynamicMemInfo {
     uint64_t data_addr; uint32_t data_rkey;
     uint64_t buf0_addr; uint32_t buf0_rkey;
     uint64_t buf1_addr; uint32_t buf1_rkey;
-    // Phase 7: IPC Handles (动态变化的内存也需要重新生成 IPC 句柄)
     cudaIpcMemHandle_t data_ipc;
     cudaIpcMemHandle_t buf0_ipc;
     cudaIpcMemHandle_t buf1_ipc;
@@ -38,7 +37,7 @@ struct RdmaInfo {
     uint64_t host_hash;             
     cudaIpcMemHandle_t flag_ipc;    
 
-    // 动态信息 (Data & Buffers) - 会在每次 AllReduce 更新
+    // 动态信息 (Data & Buffers)
     uint64_t data_addr; uint32_t data_rkey;
     uint64_t buffer_addr[2]; uint32_t buffer_rkey[2];
     cudaIpcMemHandle_t data_ipc;    
@@ -86,7 +85,6 @@ private:
 struct PeerIpcPtrs {
     bool is_local = false;
     void* flag_ptr = nullptr;
-    // 动态指针，每次更新
     void* data_ptr = nullptr;
     void* buffer_ptr[2] = {nullptr, nullptr};
 };
@@ -123,11 +121,8 @@ public:
         if (cq_) ibv_destroy_cq(cq_);
         if (pd_) ibv_dealloc_pd(pd_);
         if (ctx_) ibv_close_device(ctx_);
-        
-        // TODO: 正确关闭 IPC 句柄
     }
 
-    // Step 1.2: init 只做一次，建立 QP 和 静态信息交换
     void init() override {
         create_qps();
         exchange_static_info_and_connect(); 
@@ -151,10 +146,6 @@ public:
     RdmaInfo get_peer_info(int rank) { return peer_infos_[rank]; }
     PeerIpcPtrs get_peer_ipc_ptrs(int rank) { return peer_ipc_ptrs_[rank]; }
 
-    // =================================================================
-    // Step 1.2 New: 动态信息交换 (On Hot Path)
-    // 利用长连接 TCP，快速交换本次 AllReduce 的 Data/Buffer 信息
-    // =================================================================
     void exchange_dynamic_info(uint64_t data_addr, uint32_t data_rkey,
                                uint64_t buf0_addr, uint32_t buf0_rkey,
                                uint64_t buf1_addr, uint32_t buf1_rkey,
@@ -166,52 +157,34 @@ public:
         my_dyn.buf0_addr = buf0_addr; my_dyn.buf0_rkey = buf0_rkey;
         my_dyn.buf1_addr = buf1_addr; my_dyn.buf1_rkey = buf1_rkey;
         
-        // 生成 IPC 句柄 (增加错误检查与清理)
         void* d_ptr = nullptr;
         cudaError_t ret = cudaSuccess;
 
-        // 1. Data Handle
+        // Data Handle
         ret = cudaHostGetDevicePointer(&d_ptr, raw_data_ptr, 0);
-        if (ret != cudaSuccess) { 
-            cudaGetLastError(); // Clear error
-            memset(&my_dyn.data_ipc, 0, sizeof(my_dyn.data_ipc)); 
-        } else {
+        if (ret != cudaSuccess) { cudaGetLastError(); memset(&my_dyn.data_ipc, 0, sizeof(my_dyn.data_ipc)); } 
+        else {
             ret = cudaIpcGetMemHandle(&my_dyn.data_ipc, d_ptr);
-            if (ret != cudaSuccess) { 
-                cudaGetLastError(); // Clear error
-                memset(&my_dyn.data_ipc, 0, sizeof(my_dyn.data_ipc));
-            }
+            if (ret != cudaSuccess) { cudaGetLastError(); memset(&my_dyn.data_ipc, 0, sizeof(my_dyn.data_ipc)); }
         }
         
-        // 2. Buf0 Handle
+        // Buf0 Handle
         ret = cudaHostGetDevicePointer(&d_ptr, raw_buf0_ptr, 0);
-        if (ret != cudaSuccess) { 
-            cudaGetLastError(); 
-            memset(&my_dyn.buf0_ipc, 0, sizeof(my_dyn.buf0_ipc)); 
-        } else {
+        if (ret != cudaSuccess) { cudaGetLastError(); memset(&my_dyn.buf0_ipc, 0, sizeof(my_dyn.buf0_ipc)); } 
+        else {
             ret = cudaIpcGetMemHandle(&my_dyn.buf0_ipc, d_ptr);
-            if (ret != cudaSuccess) { 
-                cudaGetLastError(); 
-                memset(&my_dyn.buf0_ipc, 0, sizeof(my_dyn.buf0_ipc));
-            }
+            if (ret != cudaSuccess) { cudaGetLastError(); memset(&my_dyn.buf0_ipc, 0, sizeof(my_dyn.buf0_ipc)); }
         }
         
-        // 3. Buf1 Handle
+        // Buf1 Handle
         ret = cudaHostGetDevicePointer(&d_ptr, raw_buf1_ptr, 0);
-        if (ret != cudaSuccess) { 
-            cudaGetLastError(); 
-            memset(&my_dyn.buf1_ipc, 0, sizeof(my_dyn.buf1_ipc)); 
-        } else {
+        if (ret != cudaSuccess) { cudaGetLastError(); memset(&my_dyn.buf1_ipc, 0, sizeof(my_dyn.buf1_ipc)); } 
+        else {
             ret = cudaIpcGetMemHandle(&my_dyn.buf1_ipc, d_ptr);
-            if (ret != cudaSuccess) { 
-                cudaGetLastError(); 
-                memset(&my_dyn.buf1_ipc, 0, sizeof(my_dyn.buf1_ipc));
-            }
+            if (ret != cudaSuccess) { cudaGetLastError(); memset(&my_dyn.buf1_ipc, 0, sizeof(my_dyn.buf1_ipc)); }
         }
 
-        // 交换逻辑 (利用 rank 0 转发)
         std::vector<DynamicMemInfo> all_dyn(nRanks_);
-        
         if (rank_ == 0) {
             all_dyn[0] = my_dyn;
             for (auto& sock : client_sockets_) {
@@ -227,11 +200,8 @@ public:
             root_socket_->recv(all_dyn.data(), nRanks_ * sizeof(DynamicMemInfo));
         }
 
-        // 更新本地视图
         for (int i = 0; i < nRanks_; ++i) {
             if (i == rank_) continue;
-            
-            // 更新 RDMA Info
             peer_infos_[i].data_addr = all_dyn[i].data_addr;
             peer_infos_[i].data_rkey = all_dyn[i].data_rkey;
             peer_infos_[i].buffer_addr[0] = all_dyn[i].buf0_addr;
@@ -239,15 +209,12 @@ public:
             peer_infos_[i].buffer_addr[1] = all_dyn[i].buf1_addr;
             peer_infos_[i].buffer_rkey[1] = all_dyn[i].buf1_rkey;
             
-            // 更新 IPC Info (如果是 Local Peer)
             if (peer_ipc_ptrs_[i].is_local) {
-                // >>> 关键修复：增加错误检查与降级逻辑 <<<
                 cudaError_t ipc_err = cudaSuccess;
                 void* d_data = nullptr;
                 void* d_buf0 = nullptr;
                 void* d_buf1 = nullptr;
 
-                // 尝试打开所有句柄
                 if(ipc_err == cudaSuccess) ipc_err = cudaIpcOpenMemHandle(&d_data, all_dyn[i].data_ipc, cudaIpcMemLazyEnablePeerAccess);
                 if(ipc_err == cudaSuccess) ipc_err = cudaIpcOpenMemHandle(&d_buf0, all_dyn[i].buf0_ipc, cudaIpcMemLazyEnablePeerAccess);
                 if(ipc_err == cudaSuccess) ipc_err = cudaIpcOpenMemHandle(&d_buf1, all_dyn[i].buf1_ipc, cudaIpcMemLazyEnablePeerAccess);
@@ -257,21 +224,18 @@ public:
                     peer_ipc_ptrs_[i].buffer_ptr[0] = d_buf0;
                     peer_ipc_ptrs_[i].buffer_ptr[1] = d_buf1;
                 } else {
-                    // 失败！打印警告，清除错误，并降级为 RDMA
-                    // std::cerr << "[Topo] Dynamic IPC Open Failed: " << cudaGetErrorString(ipc_err) << ". Fallback to RDMA." << std::endl;
-                    cudaGetLastError(); // 清除 Error State (Crucial!)
-                    peer_ipc_ptrs_[i].is_local = false; // 标记为非本地，后续走 RDMA
-                    
-                    // TODO: 清理可能成功了一半的句柄
+                    cudaGetLastError(); 
+                    peer_ipc_ptrs_[i].is_local = false; 
                 }
             }
         }
     }
 
+    // Step 2.1: 增加 signaled 参数，默认 true
     Request* write(int rank, std::shared_ptr<MemoryRegion> local_mr, size_t offset, size_t length,
-                   uint64_t remote_addr, uint32_t remote_rkey) override {
+                   uint64_t remote_addr, uint32_t remote_rkey, bool signaled = true) override {
         auto rmr = std::static_pointer_cast<RDMAMemoryRegion>(local_mr);
-        uint64_t wr_id = next_wr_id_++;
+        uint64_t wr_id = next_wr_id_++; // WR ID 依然递增，方便调试
         struct ibv_sge sge;
         sge.addr = (uint64_t)rmr->ptr() + offset;
         sge.length = length;
@@ -282,16 +246,20 @@ public:
         wr.sg_list = &sge;
         wr.num_sge = 1;
         wr.opcode = IBV_WR_RDMA_WRITE;
-        wr.send_flags = IBV_SEND_SIGNALED;
+        wr.send_flags = 0;
+        if (signaled) wr.send_flags |= IBV_SEND_SIGNALED; // Selective Signaling
         wr.wr.rdma.remote_addr = remote_addr;
         wr.wr.rdma.rkey = remote_rkey;
 
         struct ibv_send_wr* bad_wr;
         if (ibv_post_send(qps_[rank], &wr, &bad_wr)) throw std::runtime_error("ibv_post_send (WRITE) failed");
+        
+        // 如果不 Signal，就没法 wait，也不需要 Request 对象
+        if (!signaled) return nullptr;
         return allocateRequest(wr_id);
     }
 
-    Request* write_signal(int rank, int flag_idx, uint32_t value) override {
+    Request* write_signal(int rank, int flag_idx, uint32_t value, bool signaled = true) override {
         uint64_t wr_id = next_wr_id_++;
         uint64_t remote_addr = peer_infos_[rank].flag_addr + flag_idx * sizeof(uint32_t);
         uint32_t rkey = peer_infos_[rank].flag_rkey;
@@ -299,7 +267,8 @@ public:
         struct ibv_send_wr wr = {};
         wr.wr_id = wr_id;
         wr.opcode = IBV_WR_RDMA_WRITE;
-        wr.send_flags = IBV_SEND_SIGNALED | IBV_SEND_INLINE;
+        wr.send_flags = IBV_SEND_INLINE; // Signal 小包必须 Inline 保证性能
+        if (signaled) wr.send_flags |= IBV_SEND_SIGNALED;
         
         struct ibv_sge sge;
         sge.addr = (uint64_t)&value; 
@@ -313,6 +282,8 @@ public:
 
         struct ibv_send_wr* bad_wr;
         if (ibv_post_send(qps_[rank], &wr, &bad_wr)) throw std::runtime_error("ibv_post_send (SIGNAL) failed");
+        
+        if (!signaled) return nullptr;
         return allocateRequest(wr_id);
     }
 
@@ -353,9 +324,8 @@ private:
     struct ibv_cq* cq_ = nullptr;
     std::map<int, struct ibv_qp*> qps_;
     
-    // TCP Sockets (持久化)
-    std::shared_ptr<Socket> root_socket_; // Client Only
-    std::vector<std::shared_ptr<Socket>> client_sockets_; // Root Only
+    std::shared_ptr<Socket> root_socket_; 
+    std::vector<std::shared_ptr<Socket>> client_sockets_; 
 
     uint32_t* flags_ = nullptr;
     uint32_t* abort_flag_ = nullptr; 
@@ -365,7 +335,6 @@ private:
     std::map<int, PeerIpcPtrs> peer_ipc_ptrs_;
 
     uint64_t my_host_hash_;
-    
     cudaIpcMemHandle_t my_flag_ipc_;
 
     uint64_t next_wr_id_ = 0;
@@ -409,14 +378,12 @@ private:
         }
     }
 
-    // 只交换静态信息（建链、Flag、HostHash），并保留 Socket 连接
     void exchange_static_info_and_connect() {
         struct ibv_port_attr port_attr;
         ibv_query_port(ctx_, 1, &port_attr);
         union ibv_gid my_gid;
         ibv_query_gid(ctx_, 1, 1, &my_gid);
         
-        // 准备 IPC Handle for Flag
         void* d_flag; cudaHostGetDevicePointer(&d_flag, flags_, 0);
         cudaIpcGetMemHandle(&my_flag_ipc_, d_flag);
 
@@ -425,46 +392,37 @@ private:
             if (i == rank_) {
                 my_infos.push_back({}); 
             } else {
-                RdmaInfo info = {}; // Zero init
+                RdmaInfo info = {}; 
                 info.rank = rank_;
                 info.qp_num = qps_[i]->qp_num;
                 info.lid = port_attr.lid;
                 memcpy(info.gid, my_gid.raw, 16);
-                
                 info.flag_addr = (uint64_t)flags_;
                 info.flag_rkey = mr_flags_->rkey;
-                
                 info.host_hash = my_host_hash_;
                 info.flag_ipc = my_flag_ipc_;
-                
                 my_infos.push_back(info);
             }
         }
         
         std::vector<std::vector<RdmaInfo>> global_registry(nRanks_);
-        
-        // 建立 TCP 并保留
         if (rank_ == 0) {
             ServerSocket server(8888);
             global_registry[0] = my_infos;
-            
-            // Accept nRanks-1 clients
             for (int i = 1; i < nRanks_; ++i) {
                 auto sock = server.accept();
-                client_sockets_.push_back(sock); // Persist socket
-                
+                client_sockets_.push_back(sock); 
                 int r; sock->recv(&r, sizeof(int));
                 std::vector<RdmaInfo> peer_infos(nRanks_);
                 sock->recv(peer_infos.data(), nRanks_ * sizeof(RdmaInfo));
                 global_registry[r] = peer_infos;
             }
-            // Distribute
             for (auto& sock : client_sockets_) {
                 for (int i = 0; i < nRanks_; ++i) 
                     sock->send(global_registry[i].data(), nRanks_ * sizeof(RdmaInfo));
             }
         } else {
-            root_socket_ = connect_to(root_ip_, 8888); // Persist socket
+            root_socket_ = connect_to(root_ip_, 8888); 
             root_socket_->send(&rank_, sizeof(int));
             root_socket_->send(my_infos.data(), nRanks_ * sizeof(RdmaInfo));
             for(int i=0; i<nRanks_; ++i) {
@@ -473,7 +431,6 @@ private:
             }
         }
 
-        // Connect QPs and Setup Static IPC
         for (int i = 0; i < nRanks_; ++i) {
             if (i == rank_) continue;
             peer_infos_[i] = global_registry[i][rank_]; 
@@ -483,12 +440,11 @@ private:
             ipc_ptrs.is_local = false;
 
             if (peer_infos_[i].host_hash == my_host_hash_) {
-                // std::cout << "[Topo] Rank " << i << " is LOCAL. Mapping Flag..." << std::endl;
                 cudaError_t err = cudaIpcOpenMemHandle(&ipc_ptrs.flag_ptr, peer_infos_[i].flag_ipc, cudaIpcMemLazyEnablePeerAccess);
                 if(err == cudaSuccess) {
                     ipc_ptrs.is_local = true;
                 } else {
-                    cudaGetLastError(); // Clear error
+                    cudaGetLastError(); 
                 }
             }
             peer_ipc_ptrs_[i] = ipc_ptrs;

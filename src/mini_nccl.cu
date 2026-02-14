@@ -6,10 +6,13 @@
 #include <cfloat> 
 #include <chrono> 
 #include <thread> 
+#include <queue> // New for request window
 
 namespace mini_nccl {
 
 const size_t SLICE_SIZE = 128 * 1024; 
+const int WINDOW_SIZE = 64;   // Max in-flight signaled requests
+const int SIGNAL_BATCH = 16;  // Signal every 16 ops
 
 __global__ void wait_kernel(volatile uint32_t* flag_addr, uint32_t expected, volatile uint32_t* abort_flag) {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
@@ -58,10 +61,8 @@ void allreduce_impl(T* data, int count, Op op, std::shared_ptr<Context> ctx, cud
     auto transport = std::dynamic_pointer_cast<RDMATransport>(ctx->transport());
     if (!transport) throw std::runtime_error("Phase 7 requires RDMATransport");
 
-    // 1. 注册本次的数据内存 (Fast Registration)
     auto mr_data = ctx->registerMemory(data, count * type_size);
 
-    // 2. 分配并注册双缓冲 (TODO: Move to Context/Pool for performance)
     T* buffers[2];
     std::shared_ptr<MemoryRegion> mr_buffers[2];
     for(int i=0; i<2; ++i) {
@@ -69,8 +70,6 @@ void allreduce_impl(T* data, int count, Op op, std::shared_ptr<Context> ctx, cud
         mr_buffers[i] = ctx->registerMemory(buffers[i], SLICE_SIZE);
     }
 
-    // 3. Step 1.2: 动态交换本次 Buffer 的信息 (取代原先的 init 重建链)
-    // 这是一个轻量级的 TCP 交换，比 QP Reset 快得多
     transport->exchange_dynamic_info(
         (uint64_t)mr_data->ptr(), mr_data->rkey(),
         (uint64_t)mr_buffers[0]->ptr(), mr_buffers[0]->rkey(),
@@ -85,6 +84,9 @@ void allreduce_impl(T* data, int count, Op op, std::shared_ptr<Context> ctx, cud
     volatile uint32_t* d_flags = transport->get_flags_ptr();
     volatile uint32_t* d_abort_flag = transport->get_abort_flag_dev_ptr();
 
+    // Step 2.2: 流控窗口 (只追踪 Signaled Requests)
+    std::queue<Request*> pending_reqs;
+
     // ================= Phase 1: Scatter-Reduce =================
     for (int i = 0; i < size - 1; ++i) {
         int send_idx = (rank - i + size) % size; 
@@ -97,6 +99,10 @@ void allreduce_impl(T* data, int count, Op op, std::shared_ptr<Context> ctx, cud
             int current_slice_elems = current_slice_bytes / type_size;
             int curr_buff_idx = s % 2; 
             
+            // 是否产生完成信号？(每16个切片一次，或最后一个切片)
+            // 注意：最后一个 Slice 必须 Signal，否则可能永远无法确认完成
+            bool do_signal = ((s % SIGNAL_BATCH) == 0) || (s == num_slices - 1);
+
             wait_kernel<<<1, 1, 0, stream>>>(&d_flags[curr_buff_idx], signal_seq, d_abort_flag);
 
             T* d_target = data + (recv_idx * chunk_count) + (s * (SLICE_SIZE/type_size));
@@ -105,28 +111,42 @@ void allreduce_impl(T* data, int count, Op op, std::shared_ptr<Context> ctx, cud
             elementwise_reduce_kernel<<<blocks, threads, 0, stream>>>(d_target, buffers[curr_buff_idx], d_target, current_slice_elems, op);
 
             if (send_peer_ipc.is_local) {
-                // IPC Path
                 void* remote_buffer = send_peer_ipc.buffer_ptr[s % 2];
                 void* local_src = (char*)data + block_send_offset + s * SLICE_SIZE;
                 checkCuda(cudaMemcpyAsync(remote_buffer, local_src, current_slice_bytes, cudaMemcpyDeviceToDevice, stream), "IPC Memcpy");
                 volatile uint32_t* remote_flag = (volatile uint32_t*)send_peer_ipc.flag_ptr + curr_buff_idx;
                 set_flag_kernel<<<1, 1, 0, stream>>>(remote_flag, signal_seq);
             } else {
-                // RDMA Path
                 uint64_t remote_dst_addr = send_peer_info.buffer_addr[s % 2];
                 uint32_t remote_rkey = send_peer_info.buffer_rkey[s % 2];
-                Request* req_write = transport->write(send_to, mr_data, block_send_offset + s * SLICE_SIZE, current_slice_bytes, 
-                                                    remote_dst_addr, remote_rkey);
-                Request* req_sig = transport->write_signal(send_to, curr_buff_idx, signal_seq);
                 
-                req_write->wait(); req_write->release();
-                req_sig->wait(); req_sig->release();
+                // Write Data (Unsignaled usually)
+                Request* req_write = transport->write(send_to, mr_data, block_send_offset + s * SLICE_SIZE, current_slice_bytes, 
+                                                    remote_dst_addr, remote_rkey, false); // Data Write 从不 Signal，节省 CQ
+                
+                // Write Signal (Selective Signal)
+                // 只有 Signal Write 需要确认，因为它标志着数据已到达
+                Request* req_sig = transport->write_signal(send_to, curr_buff_idx, signal_seq, do_signal);
+                
+                if (req_sig) pending_reqs.push(req_sig);
+                
+                // 窗口回收：如果堆积太多，等待最老的一个
+                if (pending_reqs.size() > WINDOW_SIZE) {
+                    Request* oldest = pending_reqs.front();
+                    oldest->wait(); oldest->release();
+                    pending_reqs.pop();
+                }
             }
             signal_seq++; 
         }
     }
     
     // ================= Phase 2: All-Gather =================
+    // 清空 Phase 1 的残留请求 (保险起见)
+    while(!pending_reqs.empty()) {
+        pending_reqs.front()->wait(); pending_reqs.front()->release(); pending_reqs.pop();
+    }
+
     for (int i = 0; i < size - 1; ++i) {
         int send_idx = (rank - i + 1 + size) % size;
         size_t block_send_offset = send_idx * chunk_bytes;
@@ -135,6 +155,7 @@ void allreduce_impl(T* data, int count, Op op, std::shared_ptr<Context> ctx, cud
         for (int s = 0; s < num_slices; ++s) {
              size_t current_slice_bytes = std::min(SLICE_SIZE, chunk_bytes - s * SLICE_SIZE);
              int curr_flag_idx = s % 2;
+             bool do_signal = ((s % SIGNAL_BATCH) == 0) || (s == num_slices - 1);
              
              wait_kernel<<<1, 1, 0, stream>>>(&d_flags[curr_flag_idx], signal_seq, d_abort_flag);
              
@@ -146,14 +167,26 @@ void allreduce_impl(T* data, int count, Op op, std::shared_ptr<Context> ctx, cud
                  set_flag_kernel<<<1, 1, 0, stream>>>(remote_flag, signal_seq);
              } else {
                  uint64_t remote_dst_addr = send_peer_info.data_addr + block_send_offset + s * SLICE_SIZE;
-                 Request* req_write = transport->write(send_to, mr_data, block_send_offset + s * SLICE_SIZE, current_slice_bytes,
-                                                     remote_dst_addr, send_peer_info.data_rkey);
-                 Request* req_sig = transport->write_signal(send_to, curr_flag_idx, signal_seq);
-                 req_write->wait(); req_write->release();
-                 req_sig->wait(); req_sig->release();
+                 
+                 transport->write(send_to, mr_data, block_send_offset + s * SLICE_SIZE, current_slice_bytes,
+                                                     remote_dst_addr, send_peer_info.data_rkey, false);
+                 
+                 Request* req_sig = transport->write_signal(send_to, curr_flag_idx, signal_seq, do_signal);
+                 
+                 if (req_sig) pending_reqs.push(req_sig);
+                 if (pending_reqs.size() > WINDOW_SIZE) {
+                    Request* oldest = pending_reqs.front();
+                    oldest->wait(); oldest->release();
+                    pending_reqs.pop();
+                 }
              }
              signal_seq++;
         }
+    }
+
+    // 最终清空 Phase 2 的请求
+    while(!pending_reqs.empty()) {
+        pending_reqs.front()->wait(); pending_reqs.front()->release(); pending_reqs.pop();
     }
 
     auto start_time = std::chrono::high_resolution_clock::now();
