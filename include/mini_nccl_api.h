@@ -17,7 +17,10 @@ typedef enum {
     ncclUnhandledCudaError = 1,
     ncclSystemError = 2,
     ncclInternalError = 3,
-    ncclInvalidArgument = 4
+    ncclInvalidArgument = 4,
+    ncclInvalidUsage = 5,       // 新增: 用法错误
+    ncclRemoteError = 6,        // 新增: 远端错误
+    ncclInProgress = 7          // 新增: 进行中
 } ncclResult_t;
 
 typedef struct ncclComm* ncclComm_t;
