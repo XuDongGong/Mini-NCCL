@@ -18,6 +18,13 @@ struct RdmaInfo {
     uint32_t qp_num;
     uint16_t lid;
     uint8_t gid[16];
+    uint64_t flag_addr;
+    uint32_t flag_rkey;
+    uint64_t data_addr; 
+    uint32_t data_rkey;
+    // 新增：双缓冲的地址和 RKey
+    uint64_t buffer_addr[2];
+    uint32_t buffer_rkey[2];
 };
 
 class RDMAMemoryRegion : public MemoryRegion {
@@ -30,6 +37,7 @@ public:
     ~RDMAMemoryRegion() { if (mr_) ibv_dereg_mr(mr_); }
     void* ptr() const override { return ptr_; }
     size_t size() const override { return size_; }
+    uint32_t rkey() const override { return mr_->rkey; } 
     uint32_t lkey() const { return mr_->lkey; }
 private:
     void* ptr_;
@@ -37,30 +45,19 @@ private:
     struct ibv_mr* mr_;
 };
 
-class RDMATransport; // Forward decl
+class RDMATransport;
 
-// --- Request 实现 (支持复用) ---
 class RDMARequest : public Request {
 public:
     RDMARequest() : transport_(nullptr), wr_id_(0), completed_(false), pool_idx_(-1) {}
-
-    // 重置状态 (替代构造函数)
     void reset(RDMATransport* transport, uint64_t wr_id, int pool_idx) {
-        transport_ = transport;
-        wr_id_ = wr_id;
-        pool_idx_ = pool_idx;
-        completed_ = false;
+        transport_ = transport; wr_id_ = wr_id; pool_idx_ = pool_idx; completed_ = false;
     }
-
     void wait() override; 
-    void release() override; // 归还自己
-
+    void release() override;
     bool isCompleted() const override { return completed_; }
-    
-    // 供 Transport 更新状态
     void markCompleted() { completed_ = true; }
     uint64_t id() const { return wr_id_; }
-
 private:
     RDMATransport* transport_;
     uint64_t wr_id_;
@@ -72,20 +69,23 @@ class RDMATransport : public Transport {
 public:
     RDMATransport(int rank, int nRanks, std::string root_ip = "127.0.0.1") 
         : rank_(rank), nRanks_(nRanks), root_ip_(root_ip) {
-        setup_device();
+
+        // 必须在任何 CUDA 调用前设置
+        cudaSetDeviceFlags(cudaDeviceMapHost);
         
-        // --- 内存池初始化 ---
-        // 预分配 4096 个请求对象，足够跑满流水线
-        // 使用 vector 保证内存连续性 (Cache Friendly)
-        int pool_size = 4096; 
-        request_pool_.resize(pool_size);
-        free_indices_.reserve(pool_size);
-        for (int i = 0; i < pool_size; ++i) {
-            free_indices_.push_back(i);
-        }
+        setup_device();
+        init_memory_pool();
+        
+        size_t flag_size = 1024 * sizeof(uint32_t);
+        cudaHostAlloc(&flags_, flag_size, cudaHostAllocMapped);
+        mr_flags_ = ibv_reg_mr(pd_, flags_, flag_size, 
+            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
+        memset(flags_, 0, flag_size);
     }
 
     ~RDMATransport() {
+        if (mr_flags_) ibv_dereg_mr(mr_flags_);
+        if (flags_) cudaFreeHost(flags_);
         for (auto& pair : qps_) if (pair.second) ibv_destroy_qp(pair.second);
         if (cq_) ibv_destroy_cq(cq_);
         if (pd_) ibv_dealloc_pd(pd_);
@@ -97,33 +97,22 @@ public:
         exchange_and_connect();
     }
 
-    // --- 对象池分配 (O(1)) ---
-    RDMARequest* allocateRequest(uint64_t wr_id) {
-        if (free_indices_.empty()) {
-            throw std::runtime_error("RDMA Request Pool Exhausted! Leak or pool too small.");
+    uint32_t* get_flags_ptr() override { 
+        uint32_t* d_ptr = nullptr;
+        cudaError_t err = cudaHostGetDevicePointer(&d_ptr, flags_, 0);
+        if (err != cudaSuccess) {
+            std::cerr << "CUDA Error in get_flags_ptr: " << cudaGetErrorString(err) << std::endl;
+            exit(1); 
         }
-        int idx = free_indices_.back();
-        free_indices_.pop_back();
-
-        RDMARequest* req = &request_pool_[idx];
-        req->reset(this, wr_id, idx);
-        return req;
+        return d_ptr;
     }
 
-    // --- 对象池回收 (O(1)) ---
-    void freeRequest(int idx) {
-        free_indices_.push_back(idx);
-    }
+    RdmaInfo get_peer_info(int rank) { return peer_infos_[rank]; }
 
-    std::shared_ptr<MemoryRegion> registerMemory(void* ptr, size_t size) override {
-        return std::make_shared<RDMAMemoryRegion>(pd_, ptr, size);
-    }
-
-    // Isend (无锁，无 malloc)
-    Request* isend(int rank, std::shared_ptr<MemoryRegion> mr, size_t offset, size_t length) override {
-        auto rmr = std::static_pointer_cast<RDMAMemoryRegion>(mr);
+    Request* write(int rank, std::shared_ptr<MemoryRegion> local_mr, size_t offset, size_t length,
+                   uint64_t remote_addr, uint32_t remote_rkey) override {
+        auto rmr = std::static_pointer_cast<RDMAMemoryRegion>(local_mr);
         uint64_t wr_id = next_wr_id_++;
-        
         struct ibv_sge sge;
         sge.addr = (uint64_t)rmr->ptr() + offset;
         sge.length = length;
@@ -133,65 +122,80 @@ public:
         wr.wr_id = wr_id;
         wr.sg_list = &sge;
         wr.num_sge = 1;
-        wr.opcode = IBV_WR_SEND;
+        wr.opcode = IBV_WR_RDMA_WRITE;
         wr.send_flags = IBV_SEND_SIGNALED;
+        wr.wr.rdma.remote_addr = remote_addr;
+        wr.wr.rdma.rkey = remote_rkey;
 
         struct ibv_send_wr* bad_wr;
-        if (ibv_post_send(qps_[rank], &wr, &bad_wr)) {
-            throw std::runtime_error("ibv_post_send failed");
-        }
-
+        if (ibv_post_send(qps_[rank], &wr, &bad_wr)) throw std::runtime_error("ibv_post_send (WRITE) failed");
         return allocateRequest(wr_id);
     }
 
-    // Irecv (无锁，无 malloc)
-    Request* irecv(int rank, std::shared_ptr<MemoryRegion> mr, size_t offset, size_t length) override {
-        auto rmr = std::static_pointer_cast<RDMAMemoryRegion>(mr);
+    Request* write_signal(int rank, int flag_idx, uint32_t value) override {
         uint64_t wr_id = next_wr_id_++;
+        uint64_t remote_addr = peer_infos_[rank].flag_addr + flag_idx * sizeof(uint32_t);
+        uint32_t rkey = peer_infos_[rank].flag_rkey;
 
-        struct ibv_sge sge;
-        sge.addr = (uint64_t)rmr->ptr() + offset;
-        sge.length = length;
-        sge.lkey = rmr->lkey();
-
-        struct ibv_recv_wr wr = {};
+        struct ibv_send_wr wr = {};
         wr.wr_id = wr_id;
+        wr.opcode = IBV_WR_RDMA_WRITE;
+        wr.send_flags = IBV_SEND_SIGNALED | IBV_SEND_INLINE;
+        
+        struct ibv_sge sge;
+        sge.addr = (uint64_t)&value; 
+        sge.length = sizeof(uint32_t);
+        sge.lkey = 0; 
+
         wr.sg_list = &sge;
         wr.num_sge = 1;
+        wr.wr.rdma.remote_addr = remote_addr;
+        wr.wr.rdma.rkey = rkey;
 
-        struct ibv_recv_wr* bad_wr;
-        if (ibv_post_recv(qps_[rank], &wr, &bad_wr)) {
-            throw std::runtime_error("ibv_post_recv failed");
-        }
-
+        struct ibv_send_wr* bad_wr;
+        if (ibv_post_send(qps_[rank], &wr, &bad_wr)) throw std::runtime_error("ibv_post_send (SIGNAL) failed");
         return allocateRequest(wr_id);
     }
 
+    Request* isend(int rank, std::shared_ptr<MemoryRegion> mr, size_t offset, size_t length) override { return nullptr; }
+    Request* irecv(int rank, std::shared_ptr<MemoryRegion> mr, size_t offset, size_t length) override { return nullptr; }
+    std::shared_ptr<MemoryRegion> registerMemory(void* ptr, size_t size) override {
+        return std::make_shared<RDMAMemoryRegion>(pd_, ptr, size);
+    }
+
+    RDMARequest* allocateRequest(uint64_t wr_id) {
+        if (free_indices_.empty()) return nullptr;
+        int idx = free_indices_.back(); free_indices_.pop_back();
+        RDMARequest* req = &request_pool_[idx];
+        req->reset(this, wr_id, idx);
+        return req;
+    }
+    void freeRequest(int idx) { free_indices_.push_back(idx); }
     void poll() {
         struct ibv_wc wc[16];
         int n = ibv_poll_cq(cq_, 16, wc);
-        if (n < 0) throw std::runtime_error("poll_cq failed");
-
-        for (int i = 0; i < n; ++i) {
-            if (wc[i].status != IBV_WC_SUCCESS) {
-                std::cerr << "WC Error: " << ibv_wc_status_str(wc[i].status) << std::endl;
-                throw std::runtime_error("Work Completion Error");
-            }
-            completed_ids_.insert(wc[i].wr_id);
-        }
+        for (int i = 0; i < n; ++i) completed_ids_.insert(wc[i].wr_id);
     }
-
     bool check_completion(uint64_t wr_id) {
         poll();
         auto it = completed_ids_.find(wr_id);
-        if (it != completed_ids_.end()) {
-            completed_ids_.erase(it); // 关键优化：用完即删，防止 Set 膨胀
-            return true;
-        }
+        if (it != completed_ids_.end()) { completed_ids_.erase(it); return true; }
         return false;
     }
 
     friend class RDMARequest;
+
+    // Phase 6: 设置本地信息 (Data + Buffer)
+    void set_local_mem_info(uint64_t data_addr, uint32_t data_rkey,
+                            uint64_t buf0_addr, uint32_t buf0_rkey,
+                            uint64_t buf1_addr, uint32_t buf1_rkey) {
+        my_data_addr_ = data_addr;
+        my_data_rkey_ = data_rkey;
+        my_buffer_addrs_[0] = buf0_addr;
+        my_buffer_rkeys_[0] = buf0_rkey;
+        my_buffer_addrs_[1] = buf1_addr;
+        my_buffer_rkeys_[1] = buf1_rkey;
+    }
 
 private:
     int rank_;
@@ -202,25 +206,39 @@ private:
     struct ibv_cq* cq_ = nullptr;
     std::map<int, struct ibv_qp*> qps_;
     
+    uint32_t* flags_ = nullptr;
+    struct ibv_mr* mr_flags_ = nullptr;
+    std::map<int, RdmaInfo> peer_infos_; 
+
+    // 本地信息
+    uint64_t my_data_addr_ = 0;
+    uint32_t my_data_rkey_ = 0;
+    uint64_t my_buffer_addrs_[2] = {0, 0};
+    uint32_t my_buffer_rkeys_[2] = {0, 0};
+
     uint64_t next_wr_id_ = 0;
     std::unordered_set<uint64_t> completed_ids_;
-
-    // --- 内存池数据结构 ---
     std::vector<RDMARequest> request_pool_; 
     std::vector<int> free_indices_;
 
-    // --- 辅助函数 (保持不变) ---
+    void init_memory_pool() {
+        int pool_size = 4096; 
+        request_pool_.resize(pool_size);
+        free_indices_.reserve(pool_size);
+        for (int i = 0; i < pool_size; ++i) free_indices_.push_back(i);
+    }
+
     void setup_device() {
         int num_devices;
         struct ibv_device** dev_list = ibv_get_device_list(&num_devices);
-        if (!dev_list) throw std::runtime_error("No RDMA devices");
+        if(!dev_list) throw std::runtime_error("No RDMA device");
         struct ibv_device* device = nullptr;
         for (int i = 0; i < num_devices; ++i) {
             if (std::string(ibv_get_device_name(dev_list[i])) == "rxe0") {
                 device = dev_list[i]; break;
             }
         }
-        if (!device) throw std::runtime_error("rxe0 not found");
+        if(!device) throw std::runtime_error("rxe0 not found");
         ctx_ = ibv_open_device(device);
         pd_ = ibv_alloc_pd(ctx_);
         cq_ = ibv_create_cq(ctx_, 1024, nullptr, nullptr, 0); 
@@ -231,13 +249,10 @@ private:
         for (int i = 0; i < nRanks_; ++i) {
             if (i == rank_) continue;
             struct ibv_qp_init_attr attr = {};
-            attr.send_cq = cq_;
-            attr.recv_cq = cq_;
-            attr.qp_type = IBV_QPT_RC;
-            attr.cap.max_send_wr = 1024;
-            attr.cap.max_recv_wr = 1024;
-            attr.cap.max_send_sge = 1;
-            attr.cap.max_recv_sge = 1;
+            attr.send_cq = cq_; attr.recv_cq = cq_; attr.qp_type = IBV_QPT_RC;
+            attr.cap.max_send_wr = 1024; attr.cap.max_recv_wr = 1024;
+            attr.cap.max_send_sge = 1; attr.cap.max_recv_sge = 1;
+            attr.cap.max_inline_data = 64; 
             qps_[i] = ibv_create_qp(pd_, &attr);
         }
     }
@@ -247,14 +262,24 @@ private:
         ibv_query_port(ctx_, 1, &port_attr);
         union ibv_gid my_gid;
         ibv_query_gid(ctx_, 1, 1, &my_gid);
+        
         std::vector<RdmaInfo> my_infos;
         for (int i = 0; i < nRanks_; ++i) {
-            if (i == rank_) my_infos.push_back({rank_, 0, 0, {0}});
-            else {
-                my_infos.push_back({rank_, qps_[i]->qp_num, port_attr.lid, {0}});
+            if (i == rank_) {
+                // 占位
+                my_infos.push_back({rank_, 0, 0, {0}, 0, 0, 0, 0, {0,0}, {0,0}});
+            } else {
+                my_infos.push_back({
+                    rank_, qps_[i]->qp_num, port_attr.lid, {0}, 
+                    (uint64_t)flags_, mr_flags_->rkey,
+                    my_data_addr_, my_data_rkey_,
+                    {my_buffer_addrs_[0], my_buffer_addrs_[1]},
+                    {my_buffer_rkeys_[0], my_buffer_rkeys_[1]}
+                });
                 memcpy(my_infos.back().gid, my_gid.raw, 16);
             }
         }
+        
         std::vector<std::vector<RdmaInfo>> global_registry(nRanks_);
         if (rank_ == 0) {
             ServerSocket server(8888);
@@ -281,9 +306,11 @@ private:
                 sock->recv(global_registry[i].data(), nRanks_ * sizeof(RdmaInfo));
             }
         }
+
         for (int i = 0; i < nRanks_; ++i) {
             if (i == rank_) continue;
-            connect_qp(qps_[i], global_registry[i][rank_]);
+            peer_infos_[i] = global_registry[i][rank_]; 
+            connect_qp(qps_[i], peer_infos_[i]);
         }
     }
 
@@ -323,12 +350,9 @@ private:
 
 inline void RDMARequest::wait() {
     while (!completed_) {
-        if (transport_->check_completion(wr_id_)) {
-            completed_ = true;
-        }
+        if (transport_->check_completion(wr_id_)) completed_ = true;
     }
 }
-
 inline void RDMARequest::release() {
     transport_->freeRequest(pool_idx_);
 }
