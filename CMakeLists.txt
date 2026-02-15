@@ -26,6 +26,7 @@ find_library(IBVERBS_LIB ibverbs REQUIRED)
 # ========================================================
 include_directories(include)
 include_directories(src)
+include_directories(src/hera)
 
 set(LIB_SOURCES src/mini_nccl.cu src/api.cpp)
 
@@ -79,3 +80,20 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/MiniNCCLConfig.cmake
 )
 
 message(STATUS "Configured for Install. Usage: sudo make install")
+
+# ========================================================
+# 6. Hera-Core 控制平面构建
+# ========================================================
+# Hera 也是库的一部分，但我们先构建独立的测试程序
+
+# 确保能找到 hera 头文件
+include_directories(src/hera)
+
+# 目前只有头文件，暂时不需要 add_library
+# 后续我们会在这里添加 hera_master 和 hera_worker 的源文件
+
+# Hera-Core 测试程序
+# 不需要链接 CUDA，只需要 C++ 标准库
+add_executable(hera_test tests/hera_test.cpp)
+# hera_test 是纯 CPU 代码，不需要链接 mini_nccl 库，直接编译即可
+target_include_directories(hera_test PRIVATE src/hera)
