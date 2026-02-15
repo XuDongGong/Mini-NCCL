@@ -3,7 +3,7 @@
 #include "transport/RDMATransport.h" 
 #include <iostream>
 #include <cstring>
-#include <cuda_runtime.h> // for cudaPointerGetAttributes
+#include <cuda_runtime.h> 
 
 using namespace mini_nccl;
 
@@ -26,7 +26,6 @@ ncclResult_t ncclCommInitRank(ncclComm_t* comm, int nRanks, int rank, const char
     try {
         std::string root_ip = (ip) ? std::string(ip) : "127.0.0.1";
         auto transport = std::make_shared<RDMATransport>(rank, nRanks, root_ip);
-        // 注意：这里只做基础的初始化，不应包含过重的资源分配，防止这里耗时太久
         transport->init();
         auto context = new Context(rank, nRanks, transport);
         *comm = (ncclComm_t)context;
@@ -48,16 +47,11 @@ ncclResult_t ncclCommDestroy(ncclComm_t comm) {
     }
 }
 
-// =============================================================
-// 辅助函数：类型与参数校验
-// =============================================================
-
 size_t get_type_size(ncclDataType_t type) {
     switch(type) {
         case ncclFloat:  return 4;
         case ncclInt32:  return 4;
         case ncclDouble: return 8;
-        // 显式列出不支持的类型，便于后续扩展
         case ncclInt8:
         case ncclUint8:
         case ncclUint32:
@@ -89,56 +83,51 @@ RedOp to_internal_op(ncclRedOp_t op) {
     }
 }
 
-// 严格的内存检查：当前版本只支持 Pinned Host Memory
+// 升级版指针检查：支持 GPUDirect (Device Pointer)
 void check_pointer_attributes(const void* ptr, const char* name) {
     cudaPointerAttributes attr;
     cudaError_t err = cudaPointerGetAttributes(&attr, ptr);
     
-    // 如果无法获取属性（可能是普通 malloc 内存），但在 Unified Addressing 下通常能返回
     if (err != cudaSuccess) {
-        // 清除错误状态
-        cudaGetLastError();
-        throw std::runtime_error(std::string(name) + " is not a valid CUDA pointer (did you use cudaHostAlloc?)");
+        // 允许普通 Host Memory (通过 OS Paging)
+        cudaGetLastError(); 
+        return; 
     }
 
-    // 检查是否为 Host 内存
-    if (attr.type != cudaMemoryTypeHost) {
-        // 允许 Managed Memory (Unified Memory)，但在当前 RDMA 实现下可能有性能问题，暂且放行
-        if (attr.type == cudaMemoryTypeDevice) {
-             throw std::runtime_error(std::string(name) + " is Device Memory. Current version ONLY supports Pinned Host Memory (cudaHostAlloc).");
-        }
+    // Phase 5: 允许 Device Memory (开启 GPUDirect 路径)
+    if (attr.type == cudaMemoryTypeDevice) {
+        // Pass. transport layer will handle registration
+    }
+    else if (attr.type == cudaMemoryTypeHost) {
+        // Pass. Pinned memory
+    }
+    // Managed memory 依然暂不支持，可能导致不可预期的性能问题
+    else if (attr.type == cudaMemoryTypeManaged) {
+         // Warn?
     }
 }
 
 ncclResult_t ncclAllReduce(const void* sendbuff, void* recvbuff, size_t count,
                            ncclDataType_t datatype, ncclRedOp_t op,
                            ncclComm_t comm, cudaStream_t stream) {
-    // 1. 基础参数校验
     if (!comm || !sendbuff || !recvbuff) return ncclInvalidArgument;
-    if (count == 0) return ncclSuccess; // 按照语义，空操作直接成功
+    if (count == 0) return ncclSuccess; 
 
     Context* ctx = (Context*)comm;
 
     try {
-        // 2. 类型与大小校验
         size_t type_size = get_type_size(datatype);
         size_t total_bytes = count * type_size;
 
-        // 3. 内存属性校验 (P0 级安全检查)
         check_pointer_attributes(sendbuff, "sendbuff");
         check_pointer_attributes(recvbuff, "recvbuff");
 
-        // 4. In-place 处理
-        // 如果是 Out-of-place (send != recv)，需要先拷贝到 recv
-        // 注意：这里假设了后续 kernel 是 In-place 的 (a+=b -> a)
         if (sendbuff != recvbuff) {
-            cudaMemcpyAsync(recvbuff, sendbuff, total_bytes, cudaMemcpyHostToHost, stream);
+            cudaMemcpyAsync(recvbuff, sendbuff, total_bytes, cudaMemcpyDeviceToDevice, stream);
         }
 
-        // 5. 创建 Alias Shared Ptr (不拥有所有权)
         std::shared_ptr<Context> ctx_ptr(ctx, [](Context*){}); 
         
-        // 6. 调用内部实现
         mini_nccl::allreduce(recvbuff, count, to_internal_dtype(datatype), to_internal_op(op), ctx_ptr, stream);
         
         return ncclSuccess;

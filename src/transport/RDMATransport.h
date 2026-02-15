@@ -42,10 +42,18 @@ struct RdmaInfo {
 
 class RDMAMemoryRegion : public MemoryRegion {
 public:
+    // 核心修改：支持 Device Pointer 注册 (GPUDirect)
     RDMAMemoryRegion(struct ibv_pd* pd, void* ptr, size_t size) : ptr_(ptr), size_(size) {
+        // 尝试注册 MR。如果是 GPU 显存且系统支持 GPUDirect (nvidia-peermem)，这里会成功。
+        // 如果是 Host 内存，这里也会成功。
         mr_ = ibv_reg_mr(pd, ptr, size, 
             IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
-        if (!mr_) throw std::runtime_error("Failed to register MR");
+        
+        if (!mr_) {
+            // 如果注册失败，抛出详细错误。
+            // 在 WSL2 上注册 Device Pointer 通常会失败，因为缺少内核模块。
+            throw std::runtime_error("Failed to register MR (GPUDirect RDMA not supported or memory not pinned?)");
+        }
     }
     ~RDMAMemoryRegion() { if (mr_) ibv_dereg_mr(mr_); }
     void* ptr() const override { return ptr_; }
@@ -121,18 +129,14 @@ public:
         if (pd_) ibv_dealloc_pd(pd_);
         if (ctx_) ibv_close_device(ctx_);
         
-        // Step 3.2: 安全回收所有 IPC 句柄
         for (auto& pair : peer_ipc_ptrs_) {
             if (pair.second.is_local) {
-                // 关闭静态 Flag 句柄
                 if (pair.second.flag_ptr) cudaIpcCloseMemHandle(pair.second.flag_ptr);
-                // 关闭最后一次 AllReduce 遗留的动态句柄
                 if (pair.second.data_ptr) cudaIpcCloseMemHandle(pair.second.data_ptr);
                 if (pair.second.buffer_ptr[0]) cudaIpcCloseMemHandle(pair.second.buffer_ptr[0]);
                 if (pair.second.buffer_ptr[1]) cudaIpcCloseMemHandle(pair.second.buffer_ptr[1]);
             }
         }
-        // 防止析构时抛出异常或残留错误
         cudaGetLastError(); 
     }
 
@@ -175,25 +179,31 @@ public:
         void* d_ptr = nullptr;
         cudaError_t ret = cudaSuccess;
 
+        // 尝试获取 IPC Handle。注意：如果是 GPUDirect 模式 (raw_data_ptr 是 Device 内存)，
+        // 这里依然可以尝试获取 IPC Handle。这与 RDMA 路径不冲突。
+        
         ret = cudaHostGetDevicePointer(&d_ptr, raw_data_ptr, 0);
-        if (ret != cudaSuccess) { cudaGetLastError(); memset(&my_dyn.data_ipc, 0, sizeof(my_dyn.data_ipc)); } 
-        else {
-            ret = cudaIpcGetMemHandle(&my_dyn.data_ipc, d_ptr);
-            if (ret != cudaSuccess) { cudaGetLastError(); memset(&my_dyn.data_ipc, 0, sizeof(my_dyn.data_ipc)); }
+        // 如果是 Device Pointer，GetDevicePointer 可能会失败或返回自身。
+        // 我们改为直接用 raw_ptr 尝试获取 IPC Handle
+        if (ret != cudaSuccess) { 
+            cudaGetLastError(); // 并不是 Pinned Host Memory，可能是 Device Memory
+            d_ptr = raw_data_ptr;
         }
-        
+        if (cudaIpcGetMemHandle(&my_dyn.data_ipc, d_ptr) != cudaSuccess) {
+             cudaGetLastError(); memset(&my_dyn.data_ipc, 0, sizeof(my_dyn.data_ipc)); 
+        }
+
+        // Buffer 0/1 也是同理
         ret = cudaHostGetDevicePointer(&d_ptr, raw_buf0_ptr, 0);
-        if (ret != cudaSuccess) { cudaGetLastError(); memset(&my_dyn.buf0_ipc, 0, sizeof(my_dyn.buf0_ipc)); } 
-        else {
-            ret = cudaIpcGetMemHandle(&my_dyn.buf0_ipc, d_ptr);
-            if (ret != cudaSuccess) { cudaGetLastError(); memset(&my_dyn.buf0_ipc, 0, sizeof(my_dyn.buf0_ipc)); }
+        if (ret != cudaSuccess) { cudaGetLastError(); d_ptr = raw_buf0_ptr; }
+        if (cudaIpcGetMemHandle(&my_dyn.buf0_ipc, d_ptr) != cudaSuccess) {
+             cudaGetLastError(); memset(&my_dyn.buf0_ipc, 0, sizeof(my_dyn.buf0_ipc)); 
         }
-        
+
         ret = cudaHostGetDevicePointer(&d_ptr, raw_buf1_ptr, 0);
-        if (ret != cudaSuccess) { cudaGetLastError(); memset(&my_dyn.buf1_ipc, 0, sizeof(my_dyn.buf1_ipc)); } 
-        else {
-            ret = cudaIpcGetMemHandle(&my_dyn.buf1_ipc, d_ptr);
-            if (ret != cudaSuccess) { cudaGetLastError(); memset(&my_dyn.buf1_ipc, 0, sizeof(my_dyn.buf1_ipc)); }
+        if (ret != cudaSuccess) { cudaGetLastError(); d_ptr = raw_buf1_ptr; }
+        if (cudaIpcGetMemHandle(&my_dyn.buf1_ipc, d_ptr) != cudaSuccess) {
+             cudaGetLastError(); memset(&my_dyn.buf1_ipc, 0, sizeof(my_dyn.buf1_ipc)); 
         }
 
         std::vector<DynamicMemInfo> all_dyn(nRanks_);
@@ -222,13 +232,10 @@ public:
             peer_infos_[i].buffer_rkey[1] = all_dyn[i].buf1_rkey;
             
             if (peer_ipc_ptrs_[i].is_local) {
-                // Step 3.2: 在打开新句柄前，先关闭旧的动态句柄
-                // 防止资源泄漏 (flags_ipc 是静态的，不用关)
                 if (peer_ipc_ptrs_[i].data_ptr) { cudaIpcCloseMemHandle(peer_ipc_ptrs_[i].data_ptr); peer_ipc_ptrs_[i].data_ptr = nullptr; }
                 if (peer_ipc_ptrs_[i].buffer_ptr[0]) { cudaIpcCloseMemHandle(peer_ipc_ptrs_[i].buffer_ptr[0]); peer_ipc_ptrs_[i].buffer_ptr[0] = nullptr; }
                 if (peer_ipc_ptrs_[i].buffer_ptr[1]) { cudaIpcCloseMemHandle(peer_ipc_ptrs_[i].buffer_ptr[1]); peer_ipc_ptrs_[i].buffer_ptr[1] = nullptr; }
                 
-                // 确保 Close 操作没有留下脏状态
                 cudaGetLastError();
 
                 cudaError_t ipc_err = cudaSuccess;
@@ -308,6 +315,8 @@ public:
 
     Request* isend(int rank, std::shared_ptr<MemoryRegion> mr, size_t offset, size_t length) override { return nullptr; }
     Request* irecv(int rank, std::shared_ptr<MemoryRegion> mr, size_t offset, size_t length) override { return nullptr; }
+    
+    // 覆盖：自动检测指针类型并注册
     std::shared_ptr<MemoryRegion> registerMemory(void* ptr, size_t size) override {
         return std::make_shared<RDMAMemoryRegion>(pd_, ptr, size);
     }
@@ -407,11 +416,9 @@ private:
         if (cudaHostGetDevicePointer(&d_flag, flags_, 0) != cudaSuccess)
             throw std::runtime_error("Failed to get device ptr for flags");
             
-        // 关键修复：允许失败，软降级
         if (cudaIpcGetMemHandle(&my_flag_ipc_, d_flag) != cudaSuccess) {
-            cudaGetLastError(); // 吞掉错误
-            memset(&my_flag_ipc_, 0, sizeof(my_flag_ipc_)); // 置零
-            // 此时 my_flag_ipc_ 无效，对端 map 会失败，然后自动降级 RDMA。符合预期。
+            cudaGetLastError(); 
+            memset(&my_flag_ipc_, 0, sizeof(my_flag_ipc_)); 
         }
 
         std::vector<RdmaInfo> my_infos;
