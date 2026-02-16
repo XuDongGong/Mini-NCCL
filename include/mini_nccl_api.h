@@ -58,6 +58,12 @@ ncclResult_t ncclCommInitRank(ncclComm_t* comm, int nRanks, int rank, const char
 
 ncclResult_t ncclCommDestroy(ncclComm_t comm);
 
+// 查询当前 Communicator 的 Rank ID
+ncclResult_t ncclCommUserRank(const ncclComm_t comm, int* rank);
+
+// 查询当前 Communicator 的 World Size
+ncclResult_t ncclCommCount(const ncclComm_t comm, int* count);
+
 ncclResult_t ncclAllReduce(const void* sendbuff, void* recvbuff, size_t count,
                            ncclDataType_t datatype, ncclRedOp_t op,
                            ncclComm_t comm, cudaStream_t stream);

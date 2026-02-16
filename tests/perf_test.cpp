@@ -24,7 +24,6 @@
     } \
 } while(0)
 
-// 获取高精度时间 (微秒)
 double get_us() {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -33,37 +32,43 @@ double get_us() {
 
 int main(int argc, char* argv[]) {
     if (argc < 3) {
-        std::cerr << "Usage: " << argv[0] << " <rank> <n_ranks> [root_ip]" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " <rank> <n_ranks> [master_ip]" << std::endl;
+        std::cerr << "       Pass rank = -1 to enable Hera Auto-Networking" << std::endl;
         return 1;
     }
 
-    int rank = atoi(argv[1]);
+    int rank_arg = atoi(argv[1]); // 用户输入的 Rank (可能是 -1)
     int nRanks = atoi(argv[2]);
     const char* ip = (argc > 3) ? argv[3] : "127.0.0.1";
 
-    // 绑定设备：Rank 0 -> GPU 0, Rank 1 -> GPU 0 (WSL通常只有一个GPU，模拟多卡)
-    // 如果你有真多卡，这里应该是 cudaSetDevice(rank)
+    // 绑定设备：为了简单起见，WSL2 模拟环境下统一绑定 GPU 0
     CUDA_CHECK(cudaSetDevice(0)); 
 
     ncclComm_t comm;
-    // 初始化通信域
-    NCCL_CHECK(ncclCommInitRank(&comm, nRanks, rank, ip));
+    // 初始化通信域 (如果 rank_arg 是 -1，将触发 Hera 自动组网)
+    NCCL_CHECK(ncclCommInitRank(&comm, nRanks, rank_arg, ip));
+
+    // >>> 关键逻辑：如果是自动模式，反向查询我到底是谁 <<<
+    int final_rank = rank_arg;
+    if (rank_arg == -1) {
+        NCCL_CHECK(ncclCommUserRank(comm, &final_rank));
+        // 也可以查一下总数
+        // int final_count; NCCL_CHECK(ncclCommCount(comm, &final_count));
+    }
 
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
 
-    // 测试梯度：1MB, 4MB, 16MB, 64MB, 128MB, 256MB
+    // 测试梯度
     std::vector<size_t> sizes = {
         1 * 1024 * 1024UL,
-        4 * 1024 * 1024UL,
         16 * 1024 * 1024UL,
-        64 * 1024 * 1024UL,
-        128 * 1024 * 1024UL,
-        256 * 1024 * 1024UL
+        64 * 1024 * 1024UL
     };
 
-    if (rank == 0) {
-        printf("\n=== Mini-NCCL Performance Benchmark ===\n");
+    // 只有 Rank 0 打印表头
+    if (final_rank == 0) {
+        printf("\n=== Mini-NCCL Performance Benchmark (Rank %d) ===\n", final_rank);
         printf("%15s %15s %15s %15s\n", "Size(B)", "Time(us)", "AlgBW(GB/s)", "BusBW(GB/s)");
     }
 
@@ -72,18 +77,17 @@ int main(int argc, char* argv[]) {
         float* d_send;
         float* d_recv;
 
-        // Phase 1 契约：必须使用 Pinned Host Memory
         CUDA_CHECK(cudaHostAlloc(&d_send, size, cudaHostAllocDefault));
         CUDA_CHECK(cudaHostAlloc(&d_recv, size, cudaHostAllocDefault));
 
-        // 预热 (Warmup) - 5次
-        for (int i = 0; i < 5; ++i) {
+        // 预热
+        for (int i = 0; i < 3; ++i) {
             NCCL_CHECK(ncclAllReduce(d_send, d_recv, count, ncclFloat, ncclSum, comm, stream));
         }
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
-        // 计时 (Benchmark) - 20次
-        int iterations = 20;
+        // 计时
+        int iterations = 10;
         double start = get_us();
         for (int i = 0; i < iterations; ++i) {
             NCCL_CHECK(ncclAllReduce(d_send, d_recv, count, ncclFloat, ncclSum, comm, stream));
@@ -92,24 +96,17 @@ int main(int argc, char* argv[]) {
         double end = get_us();
 
         double avg_time_us = (end - start) / iterations;
-        
-        // 算法带宽 = 数据量 / 时间
         double alg_bw = (double)size / avg_time_us / 1e3; 
-        
-        // 总线带宽 (BusBW) = 算法带宽 * 2 * (N-1) / N
-        // 对于 Ring 算法，这是衡量硬件利用率的标准指标
         double factor = 2.0 * (nRanks - 1) / (double)nRanks;
         double bus_bw = alg_bw * factor;
 
-        if (rank == 0) {
+        if (final_rank == 0) {
             printf("%15lu %15.2f %15.2f %15.2f\n", size, avg_time_us, alg_bw, bus_bw);
         }
 
         CUDA_CHECK(cudaFreeHost(d_send));
         CUDA_CHECK(cudaFreeHost(d_recv));
-        
-        // 稍微休息一下，防止热节流
-        usleep(10000);
+        usleep(5000);
     }
 
     CUDA_CHECK(cudaStreamDestroy(stream));

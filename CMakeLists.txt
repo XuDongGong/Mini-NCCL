@@ -96,4 +96,5 @@ include_directories(src/hera)
 # 不需要链接 CUDA，只需要 C++ 标准库
 add_executable(hera_test tests/hera_test.cpp)
 # hera_test 是纯 CPU 代码，不需要链接 mini_nccl 库，直接编译即可
-target_include_directories(hera_test PRIVATE src/hera)
+add_executable(hera_master tests/hera_master_main.cpp)
+target_include_directories(hera_master PRIVATE src/hera)

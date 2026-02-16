@@ -1,6 +1,7 @@
 #include "mini_nccl_api.h"
 #include "mini_nccl.h"             
 #include "transport/RDMATransport.h" 
+#include "hera/hera_worker.h" // 引入 Hera
 #include <iostream>
 #include <cstring>
 #include <cuda_runtime.h> 
@@ -22,13 +23,44 @@ const char* ncclGetErrorString(ncclResult_t result) {
 }
 
 ncclResult_t ncclCommInitRank(ncclComm_t* comm, int nRanks, int rank, const char* ip) {
-    if (!comm || nRanks <= 0 || rank < 0 || rank >= nRanks) return ncclInvalidArgument;
+    if (!comm) return ncclInvalidArgument;
     try {
-        std::string root_ip = (ip) ? std::string(ip) : "127.0.0.1";
-        auto transport = std::make_shared<RDMATransport>(rank, nRanks, root_ip);
+        int final_rank = rank;
+        int final_size = nRanks;
+        std::string final_root_ip = (ip) ? std::string(ip) : "127.0.0.1";
+
+        // ========================================================
+        // Hera-Core Integration
+        // ========================================================
+        if (rank == -1) {
+            std::cout << "[Mini-NCCL] Hera Mode Activated. Connecting to Master at " << final_root_ip << "..." << std::endl;
+            
+            // 1. 创建 Hera Worker 并连接 Master
+            // 注意: 这里我们把 'comm' 指针强转为 Context 之前，还没地方存 HeraWorker
+            // 为了简单起见，我们在这里局部创建，获取信息后销毁 (Agent 暂时只做 Bootstrap)
+            // 在 Sprint 3 后续，Context 应该持有 HeraWorker 以处理心跳
+            
+            hera::HeraWorker agent(final_root_ip, 9999);
+            agent.ConnectAndRegister();
+            
+            final_rank = agent.rank();
+            final_size = agent.size();
+            final_root_ip = agent.root_ip(); // 使用 Master 告诉我们的 Root IP (Rank 0 IP)
+            
+            std::cout << "[Mini-NCCL] Auto-Assigned Rank: " << final_rank 
+                      << " Size: " << final_size 
+                      << " Root-IP: " << final_root_ip << std::endl;
+        }
+        // ========================================================
+
+        if (final_rank < 0 || final_rank >= final_size) return ncclInvalidArgument;
+
+        auto transport = std::make_shared<RDMATransport>(final_rank, final_size, final_root_ip);
         transport->init();
-        auto context = new Context(rank, nRanks, transport);
+        
+        auto context = new Context(final_rank, final_size, transport);
         *comm = (ncclComm_t)context;
+        
         return ncclSuccess;
     } catch (const std::exception& e) {
         std::cerr << "[Mini-NCCL] Init Failed: " << e.what() << std::endl;
@@ -47,18 +79,33 @@ ncclResult_t ncclCommDestroy(ncclComm_t comm) {
     }
 }
 
+ncclResult_t ncclCommUserRank(const ncclComm_t comm, int* rank) {
+    if (!comm || !rank) return ncclInvalidArgument;
+    try {
+        Context* ctx = (Context*)comm;
+        *rank = ctx->rank();
+        return ncclSuccess;
+    } catch (...) {
+        return ncclSystemError;
+    }
+}
+
+ncclResult_t ncclCommCount(const ncclComm_t comm, int* count) {
+    if (!comm || !count) return ncclInvalidArgument;
+    try {
+        Context* ctx = (Context*)comm;
+        *count = ctx->size();
+        return ncclSuccess;
+    } catch (...) {
+        return ncclSystemError;
+    }
+}
+
 size_t get_type_size(ncclDataType_t type) {
     switch(type) {
         case ncclFloat:  return 4;
         case ncclInt32:  return 4;
         case ncclDouble: return 8;
-        case ncclInt8:
-        case ncclUint8:
-        case ncclUint32:
-        case ncclInt64:
-        case ncclUint64:
-        case ncclFloat16:
-        case ncclBfloat16:
         default:
             throw std::runtime_error("Unsupported DataType");
     }
@@ -83,28 +130,10 @@ RedOp to_internal_op(ncclRedOp_t op) {
     }
 }
 
-// 升级版指针检查：支持 GPUDirect (Device Pointer)
 void check_pointer_attributes(const void* ptr, const char* name) {
     cudaPointerAttributes attr;
     cudaError_t err = cudaPointerGetAttributes(&attr, ptr);
-    
-    if (err != cudaSuccess) {
-        // 允许普通 Host Memory (通过 OS Paging)
-        cudaGetLastError(); 
-        return; 
-    }
-
-    // Phase 5: 允许 Device Memory (开启 GPUDirect 路径)
-    if (attr.type == cudaMemoryTypeDevice) {
-        // Pass. transport layer will handle registration
-    }
-    else if (attr.type == cudaMemoryTypeHost) {
-        // Pass. Pinned memory
-    }
-    // Managed memory 依然暂不支持，可能导致不可预期的性能问题
-    else if (attr.type == cudaMemoryTypeManaged) {
-         // Warn?
-    }
+    if (err != cudaSuccess) { cudaGetLastError(); return; }
 }
 
 ncclResult_t ncclAllReduce(const void* sendbuff, void* recvbuff, size_t count,
@@ -114,27 +143,18 @@ ncclResult_t ncclAllReduce(const void* sendbuff, void* recvbuff, size_t count,
     if (count == 0) return ncclSuccess; 
 
     Context* ctx = (Context*)comm;
-
     try {
         size_t type_size = get_type_size(datatype);
         size_t total_bytes = count * type_size;
-
-        check_pointer_attributes(sendbuff, "sendbuff");
-        check_pointer_attributes(recvbuff, "recvbuff");
 
         if (sendbuff != recvbuff) {
             cudaMemcpyAsync(recvbuff, sendbuff, total_bytes, cudaMemcpyDeviceToDevice, stream);
         }
 
         std::shared_ptr<Context> ctx_ptr(ctx, [](Context*){}); 
-        
         mini_nccl::allreduce(recvbuff, count, to_internal_dtype(datatype), to_internal_op(op), ctx_ptr, stream);
         
         return ncclSuccess;
-
-    } catch (const std::runtime_error& e) {
-        std::cerr << "[Mini-NCCL] AllReduce Argument Error: " << e.what() << std::endl;
-        return ncclInvalidArgument;
     } catch (const std::exception& e) {
         std::cerr << "[Mini-NCCL] AllReduce Internal Error: " << e.what() << std::endl;
         return ncclInternalError;

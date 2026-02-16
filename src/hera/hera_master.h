@@ -12,9 +12,9 @@ namespace hera {
 struct WorkerContext {
     int fd;
     std::string hostname;
+    std::string ip; // 新增: 记录 IP
     int pid;
     int rank;
-    // 可以在这里扩展: last_heartbeat_time
 };
 
 class HeraMaster {
@@ -23,7 +23,6 @@ class HeraMaster {
     int port_;
     std::atomic<bool> running_{true};
     
-    // 存储所有连接的 Worker
     std::vector<std::unique_ptr<HeraSocket>> worker_conns_;
     std::vector<WorkerContext> worker_infos_;
 
@@ -33,22 +32,18 @@ public:
 
     void Run() {
         try {
-            // 1. 启动监听
             server_socket_.Listen(port_);
             std::cout << "[Hera-Master] Listening on port " << port_ 
                       << ", waiting for " << world_size_ << " workers..." << std::endl;
 
-            // 2. 阻塞等待所有 Worker 注册 (Bootstrap Phase)
-            // 在这一阶段，我们不需要复杂的 Epoll，只需要一个一个接客
             while (worker_conns_.size() < (size_t)world_size_) {
                 auto client = server_socket_.Accept();
                 HandleRegister(std::move(client));
             }
 
             std::cout << "[Hera-Master] All " << world_size_ << " workers registered! Cluster is Ready." << std::endl;
+            std::cout << "[Hera-Master] Root IP (Rank 0) is: " << worker_infos_[0].ip << std::endl;
 
-            // 3. (Todo in Sprint 3) 进入 Runtime 循环，处理心跳
-            // 现在先简单 sleep 模拟守护
             while(running_) {
                 std::this_thread::sleep_for(std::chrono::seconds(1));
             }
@@ -64,21 +59,20 @@ private:
     void HandleRegister(std::unique_ptr<HeraSocket> client) {
         MessageType type;
         std::vector<uint8_t> buffer;
+        std::string peer_ip = client->GetPeerIP();
 
-        // 1. 读取注册包
         if (!client->RecvMsg(type, buffer)) {
             std::cerr << "[Hera-Master] Client disconnected during registration" << std::endl;
             return;
         }
 
         if (type != MessageType::REGISTER_REQ) {
-            std::cerr << "[Hera-Master] Unexpected msg type during bootstrap" << std::endl;
+            std::cerr << "[Hera-Master] Unexpected msg type" << std::endl;
             return;
         }
 
         auto* req = (RegisterReq*)buffer.data();
         
-        // 2. 分配 Rank (简单策略：按到达顺序)
         int rank = worker_conns_.size();
         
         WorkerContext ctx;
@@ -86,18 +80,24 @@ private:
         ctx.rank = rank;
         ctx.pid = req->pid;
         ctx.hostname = req->hostname;
+        ctx.ip = peer_ip; // 记录 IP
         worker_infos_.push_back(ctx);
 
         std::cout << "[Hera-Master] New Worker: Rank=" << rank 
-                  << " Host=" << ctx.hostname << " PID=" << ctx.pid << std::endl;
+                  << " Host=" << ctx.hostname << " IP=" << ctx.ip << " PID=" << ctx.pid << std::endl;
 
-        // 3. 回复 Rank 信息
+        // 构建回复
         RegisterResp resp;
         resp.rank = rank;
         resp.world_size = world_size_;
-        client->SendMsg(MessageType::REGISTER_RESP, &resp, sizeof(resp));
+        
+        // 核心逻辑: 填充 Rank 0 的 IP
+        // 如果我是 Rank 0，那 Root IP 就是我自己
+        // 如果我是 Rank N，那 Root IP 是列表里第一个人的 IP
+        std::string root_ip = worker_infos_[0].ip;
+        strncpy(resp.root_ip, root_ip.c_str(), 63);
 
-        // 4. 保存连接 (Move ownership)
+        client->SendMsg(MessageType::REGISTER_RESP, &resp, sizeof(resp));
         worker_conns_.push_back(std::move(client));
     }
 };
