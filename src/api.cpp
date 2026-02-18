@@ -153,6 +153,26 @@ ncclResult_t ncclAllReduce(const void* sendbuff, void* recvbuff, size_t count,
     nvtxRangePushEx(&eventAttrib);
     // <<< 埋点结束 <<<
 
+    // 优化: CUDA Graph (Stream Capture) 感知 >>>
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    cudaError_t c_err = cudaStreamIsCapturing(stream, &capture_status);
+    
+    if (c_err == cudaSuccess && capture_status == cudaStreamCaptureStatusActive) {
+        // Graph Capture 时，CPU 侧的代码只会被执行一次（录制阶段），而不会被包含在 Graph 中。如果依赖 CPU 轮询 (Polling)，录制生成的 Graph 将不包含同步逻辑，导致执行时错误。
+        // 真正的解决方案是：
+        // 1. 使用 GPU Kernel 轮询内存 (GPU-Side Polling)
+        // 2. 使用 cudaStreamWaitValue (Driver API)
+        
+        static bool warned_graph = false;
+        if (!warned_graph) {
+            std::cerr << "\n[Mini-NCCL] \033[1;33mWARNING: CUDA Graph Capture Detected!\033[0m" << std::endl;
+            std::cerr << "            Current Transport relies on CPU-side polling." << std::endl;
+            std::cerr << "            Ensure no CPU synchronization is required inside the Graph.\n" << std::endl;
+            warned_graph = true;
+        }
+    }
+    // <<< 优化结束 <<<
+
     Context* ctx = (Context*)comm;
     try {
         size_t type_size = get_type_size(datatype);
