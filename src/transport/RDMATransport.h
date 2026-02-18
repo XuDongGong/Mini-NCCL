@@ -2,6 +2,8 @@
 
 #include "mini_nccl.h"
 #include "Socket.h"
+//引入无锁队列 
+#include "LockFreeQueue.h"
 #include <infiniband/verbs.h>
 #include <vector>
 #include <mutex>
@@ -13,6 +15,10 @@
 #include <unistd.h> 
 #include <atomic> 
 #include <string>
+#include <fstream>
+#include <sstream>
+#include <sched.h> 
+#include <cerrno>
 
 namespace mini_nccl {
 
@@ -42,16 +48,11 @@ struct RdmaInfo {
 
 class RDMAMemoryRegion : public MemoryRegion {
 public:
-    // 核心修改：支持 Device Pointer 注册 (GPUDirect)
     RDMAMemoryRegion(struct ibv_pd* pd, void* ptr, size_t size) : ptr_(ptr), size_(size) {
-        // 尝试注册 MR。如果是 GPU 显存且系统支持 GPUDirect (nvidia-peermem)，这里会成功。
-        // 如果是 Host 内存，这里也会成功。
         mr_ = ibv_reg_mr(pd, ptr, size, 
             IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
         
         if (!mr_) {
-            // 如果注册失败，抛出详细错误。
-            // 在 WSL2 上注册 Device Pointer 通常会失败，因为缺少内核模块。
             throw std::runtime_error("Failed to register MR (GPUDirect RDMA not supported or memory not pinned?)");
         }
     }
@@ -95,8 +96,10 @@ struct PeerIpcPtrs {
 
 class RDMATransport : public Transport {
 public:
+    // >>> 修改: 在初始化列表中初始化无锁队列 (容量 4096) >>>
     RDMATransport(int rank, int nRanks, std::string root_ip = "127.0.0.1") 
-        : rank_(rank), nRanks_(nRanks), root_ip_(root_ip) {
+        : rank_(rank), nRanks_(nRanks), root_ip_(root_ip), free_indices_(4096) {
+    // <<< 修改结束 <<<
 
         cudaSetDeviceFlags(cudaDeviceMapHost);
         
@@ -178,22 +181,16 @@ public:
         
         void* d_ptr = nullptr;
         cudaError_t ret = cudaSuccess;
-
-        // 尝试获取 IPC Handle。注意：如果是 GPUDirect 模式 (raw_data_ptr 是 Device 内存)，
-        // 这里依然可以尝试获取 IPC Handle。这与 RDMA 路径不冲突。
         
         ret = cudaHostGetDevicePointer(&d_ptr, raw_data_ptr, 0);
-        // 如果是 Device Pointer，GetDevicePointer 可能会失败或返回自身。
-        // 我们改为直接用 raw_ptr 尝试获取 IPC Handle
         if (ret != cudaSuccess) { 
-            cudaGetLastError(); // 并不是 Pinned Host Memory，可能是 Device Memory
+            cudaGetLastError(); 
             d_ptr = raw_data_ptr;
         }
         if (cudaIpcGetMemHandle(&my_dyn.data_ipc, d_ptr) != cudaSuccess) {
              cudaGetLastError(); memset(&my_dyn.data_ipc, 0, sizeof(my_dyn.data_ipc)); 
         }
 
-        // Buffer 0/1 也是同理
         ret = cudaHostGetDevicePointer(&d_ptr, raw_buf0_ptr, 0);
         if (ret != cudaSuccess) { cudaGetLastError(); d_ptr = raw_buf0_ptr; }
         if (cudaIpcGetMemHandle(&my_dyn.buf0_ipc, d_ptr) != cudaSuccess) {
@@ -316,19 +313,27 @@ public:
     Request* isend(int rank, std::shared_ptr<MemoryRegion> mr, size_t offset, size_t length) override { return nullptr; }
     Request* irecv(int rank, std::shared_ptr<MemoryRegion> mr, size_t offset, size_t length) override { return nullptr; }
     
-    // 覆盖：自动检测指针类型并注册
     std::shared_ptr<MemoryRegion> registerMemory(void* ptr, size_t size) override {
         return std::make_shared<RDMAMemoryRegion>(pd_, ptr, size);
     }
 
     RDMARequest* allocateRequest(uint64_t wr_id) {
-        if (free_indices_.empty()) return nullptr;
-        int idx = free_indices_.back(); free_indices_.pop_back();
+        // >>> 修改: 使用无锁队列 pop >>>
+        int idx;
+        if (!free_indices_.pop(idx)) return nullptr; 
+        // <<< 修改结束 <<<
+        
         RDMARequest* req = &request_pool_[idx];
         req->reset(this, wr_id, idx);
         return req;
     }
-    void freeRequest(int idx) { free_indices_.push_back(idx); }
+    
+    void freeRequest(int idx) { 
+        // >>> 修改: 使用无锁队列 push >>>
+        free_indices_.push(idx); 
+        // <<< 修改结束 <<<
+    }
+
     void poll() {
         struct ibv_wc wc[16];
         int n = ibv_poll_cq(cq_, 16, wc);
@@ -368,13 +373,20 @@ private:
     uint64_t next_wr_id_ = 0;
     std::unordered_set<uint64_t> completed_ids_;
     std::vector<RDMARequest> request_pool_; 
-    std::vector<int> free_indices_;
+    
+    // >>> 修改: 将 std::vector 替换为 LockFreeQueue >>>
+    LockFreeQueue<int> free_indices_;
+    // <<< 修改结束 <<<
 
     void init_memory_pool() {
         int pool_size = 4096; 
         request_pool_.resize(pool_size);
-        free_indices_.reserve(pool_size);
-        for (int i = 0; i < pool_size; ++i) free_indices_.push_back(i);
+        // >>> 修改: 使用无锁队列 push 进行初始化 >>>
+        // free_indices_ 已经在构造函数里初始化了容量
+        for (int i = 0; i < pool_size; ++i) {
+            free_indices_.push(i);
+        }
+        // <<< 修改结束 <<<
     }
 
     void setup_device() {
@@ -388,10 +400,57 @@ private:
             }
         }
         if(!device) throw std::runtime_error("rxe0 not found");
+        
+        bind_to_numa_node(ibv_get_device_name(device));
+
         ctx_ = ibv_open_device(device);
         pd_ = ibv_alloc_pd(ctx_);
         cq_ = ibv_create_cq(ctx_, 1024, nullptr, nullptr, 0); 
         ibv_free_device_list(dev_list);
+    }
+
+    void bind_to_numa_node(const std::string& device_name) {
+        std::string path = "/sys/class/infiniband/" + device_name + "/device/numa_node";
+        std::ifstream f(path);
+        int numa_node = -1;
+        
+        if (f >> numa_node && numa_node >= 0) {
+            std::cout << "[NUMA] Detected NIC " << device_name << " is on NUMA node " << numa_node << std::endl;
+            
+            std::string cpulist_path = "/sys/devices/system/node/node" + std::to_string(numa_node) + "/cpulist";
+            std::ifstream f_cpu(cpulist_path);
+            std::string cpulist;
+            
+            if (std::getline(f_cpu, cpulist)) {
+                cpu_set_t cpuset;
+                CPU_ZERO(&cpuset);
+                parse_cpu_list(cpulist, cpuset);
+                
+                if (sched_setaffinity(0, sizeof(cpuset), &cpuset) == 0) {
+                     std::cout << "[NUMA] Auto-Binding process to local CPUs: " << cpulist << std::endl;
+                } else {
+                     std::cerr << "[NUMA] Failed to set affinity: " << strerror(errno) << std::endl;
+                }
+            }
+        } else {
+             std::cout << "[NUMA] NIC " << device_name << " NUMA info unavailable or -1 (UMA/Virtual). Skipping binding." << std::endl;
+        }
+    }
+
+    void parse_cpu_list(const std::string& list_str, cpu_set_t& mask) {
+        std::stringstream ss(list_str);
+        std::string segment;
+        while (std::getline(ss, segment, ',')) {
+            size_t dash = segment.find('-');
+            if (dash != std::string::npos) {
+                int start = std::stoi(segment.substr(0, dash));
+                int end = std::stoi(segment.substr(dash + 1));
+                for (int i = start; i <= end; ++i) CPU_SET(i, &mask);
+            } else {
+                int cpu = std::stoi(segment);
+                CPU_SET(cpu, &mask);
+            }
+        }
     }
 
     void create_qps() {
