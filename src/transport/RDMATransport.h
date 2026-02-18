@@ -276,7 +276,8 @@ public:
         wr.wr.rdma.rkey = remote_rkey;
 
         struct ibv_send_wr* bad_wr;
-        if (ibv_post_send(qps_[rank], &wr, &bad_wr)) throw std::runtime_error("ibv_post_send (WRITE) failed");
+        // 优化: 使用 unlikely，认为发送失败是极小概率事件
+        if (unlikely(ibv_post_send(qps_[rank], &wr, &bad_wr))) throw std::runtime_error("ibv_post_send (WRITE) failed");
         
         if (!signaled) return nullptr;
         return allocateRequest(wr_id);
@@ -304,7 +305,8 @@ public:
         wr.wr.rdma.rkey = rkey;
 
         struct ibv_send_wr* bad_wr;
-        if (ibv_post_send(qps_[rank], &wr, &bad_wr)) throw std::runtime_error("ibv_post_send (SIGNAL) failed");
+        // 优化: 使用 unlikely 
+        if (unlikely(ibv_post_send(qps_[rank], &wr, &bad_wr))) throw std::runtime_error("ibv_post_send (SIGNAL) failed");
         
         if (!signaled) return nullptr;
         return allocateRequest(wr_id);

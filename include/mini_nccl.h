@@ -7,6 +7,16 @@
 #include <stdexcept>
 #include <cstdint>
 
+// 告诉编译器某条分支发生的概率极低 (unlikely) 或极高 (likely)
+// 编译器会将 "likely" 的代码紧凑排列，减少指令缓存 (I-Cache) 未命中
+#if defined(__GNUC__) || defined(__clang__)
+    #define likely(x)       __builtin_expect(!!(x), 1)
+    #define unlikely(x)     __builtin_expect(!!(x), 0)
+#else
+    #define likely(x)       (x)
+    #define unlikely(x)     (x)
+#endif
+
 namespace mini_nccl {
 
 // 定义内部使用的枚举
