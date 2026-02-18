@@ -6,6 +6,10 @@
 #include <cstring>
 #include <cuda_runtime.h> 
 
+// >>> 新增: 引入 NVTX 头文件 >>>
+#include <nvtx3/nvToolsExt.h>
+// <<< 新增结束 <<<
+
 using namespace mini_nccl;
 
 extern "C" {
@@ -30,22 +34,17 @@ ncclResult_t ncclCommInitRank(ncclComm_t* comm, int nRanks, int rank, const char
         std::string final_root_ip = (ip) ? std::string(ip) : "127.0.0.1";
 
         // ========================================================
-        // Hera-Core Integration
+        // Hera-Core Integration (逻辑保持不变)
         // ========================================================
         if (rank == -1) {
             std::cout << "[Mini-NCCL] Hera Mode Activated. Connecting to Master at " << final_root_ip << "..." << std::endl;
-            
-            // 1. 创建 Hera Worker 并连接 Master
-            // 注意: 这里我们把 'comm' 指针强转为 Context 之前，还没地方存 HeraWorker
-            // 为了简单起见，我们在这里局部创建，获取信息后销毁 (Agent 暂时只做 Bootstrap)
-            // 在 Sprint 3 后续，Context 应该持有 HeraWorker 以处理心跳
             
             hera::HeraWorker agent(final_root_ip, 9999);
             agent.ConnectAndRegister();
             
             final_rank = agent.rank();
             final_size = agent.size();
-            final_root_ip = agent.root_ip(); // 使用 Master 告诉我们的 Root IP (Rank 0 IP)
+            final_root_ip = agent.root_ip(); 
             
             std::cout << "[Mini-NCCL] Auto-Assigned Rank: " << final_rank 
                       << " Size: " << final_size 
@@ -142,10 +141,26 @@ ncclResult_t ncclAllReduce(const void* sendbuff, void* recvbuff, size_t count,
     if (!comm || !sendbuff || !recvbuff) return ncclInvalidArgument;
     if (count == 0) return ncclSuccess; 
 
+    // >>> NVTX 埋点开始 >>>
+    nvtxEventAttributes_t eventAttrib = {0};
+    eventAttrib.version = NVTX_VERSION;
+    eventAttrib.size = NVTX_EVENT_ATTRIB_STRUCT_SIZE;
+    eventAttrib.colorType = NVTX_COLOR_ARGB;
+    eventAttrib.color = 0xFFFF0000; // 纯红色，在图表中非常醒目
+    eventAttrib.messageType = NVTX_MESSAGE_TYPE_ASCII;
+    eventAttrib.message.ascii = "mini_ncclAllReduce"; // 时间轴上显示的名字
+    
+    nvtxRangePushEx(&eventAttrib);
+    // <<< 埋点结束 <<<
+
     Context* ctx = (Context*)comm;
     try {
         size_t type_size = get_type_size(datatype);
         size_t total_bytes = count * type_size;
+
+        // 简化的指针检查
+        // check_pointer_attributes(sendbuff, "sendbuff");
+        // check_pointer_attributes(recvbuff, "recvbuff");
 
         if (sendbuff != recvbuff) {
             cudaMemcpyAsync(recvbuff, sendbuff, total_bytes, cudaMemcpyDeviceToDevice, stream);
@@ -154,11 +169,17 @@ ncclResult_t ncclAllReduce(const void* sendbuff, void* recvbuff, size_t count,
         std::shared_ptr<Context> ctx_ptr(ctx, [](Context*){}); 
         mini_nccl::allreduce(recvbuff, count, to_internal_dtype(datatype), to_internal_op(op), ctx_ptr, stream);
         
+        // >>> 成功返回前 Pop >>>
+        nvtxRangePop();
         return ncclSuccess;
     } catch (const std::exception& e) {
+        // >>> 异常返回前 Pop >>>
+        nvtxRangePop();
         std::cerr << "[Mini-NCCL] AllReduce Internal Error: " << e.what() << std::endl;
         return ncclInternalError;
     } catch (...) {
+        // >>> 未知异常返回前 Pop >>>
+        nvtxRangePop();
         return ncclSystemError;
     }
 }

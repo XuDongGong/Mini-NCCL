@@ -20,6 +20,10 @@ endif()
 find_package(CUDAToolkit REQUIRED)
 find_library(IBVERBS_LIB ibverbs REQUIRED)
 
+# >>> 新增: 查找 NVTX 库 >>>
+find_library(NVTX_LIB nvToolsExt REQUIRED)
+# <<< 新增结束 <<<
+
 # ========================================================
 # 3. 构建核心库 (libmini_nccl.so)
 # ========================================================
@@ -30,7 +34,10 @@ include_directories(src/hera) # 确保能找到 Hera 头文件
 set(LIB_SOURCES src/mini_nccl.cu src/api.cpp)
 
 add_library(mini_nccl SHARED ${LIB_SOURCES})
-target_link_libraries(mini_nccl PRIVATE ${IBVERBS_LIB} CUDA::cudart)
+
+# >>> 修改: 链接 NVTX 库 >>>
+target_link_libraries(mini_nccl PRIVATE ${IBVERBS_LIB} CUDA::cudart ${NVTX_LIB})
+# <<< 修改结束 <<<
 
 # 设置公共头文件路径
 target_include_directories(mini_nccl PUBLIC 
@@ -89,4 +96,4 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/MiniNCCLConfig.cmake
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/MiniNCCL
 )
 
-message(STATUS "Configured for Install with AVX2 support.")
+message(STATUS "Configured for Install with AVX2 & NVTX support.")
