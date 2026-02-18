@@ -7,7 +7,7 @@
 #include <vector>
 #include <mutex>
 #include <map>
-#include <unordered_map> // >>> 新增: 缓存容器
+#include <unordered_map>
 #include <cstring>
 #include <iostream>
 #include <algorithm>
@@ -32,6 +32,7 @@ struct DynamicMemInfo {
     cudaIpcMemHandle_t buf1_ipc;
 };
 
+// 保持原有的 RdmaInfo 定义
 struct RdmaInfo {
     int rank;
     uint32_t qp_num;
@@ -87,6 +88,7 @@ private:
     int pool_idx_; 
 };
 
+// 保持原有的 PeerIpcPtrs 定义
 struct PeerIpcPtrs {
     bool is_local = false;
     void* flag_ptr = nullptr;
@@ -311,35 +313,10 @@ public:
     Request* isend(int rank, std::shared_ptr<MemoryRegion> mr, size_t offset, size_t length) override { return nullptr; }
     Request* irecv(int rank, std::shared_ptr<MemoryRegion> mr, size_t offset, size_t length) override { return nullptr; }
     
-    // >>> 优化: 显存注册缓存 (MR Cache) >>>
+    // 保持原样，没有 MR Cache
     std::shared_ptr<MemoryRegion> registerMemory(void* ptr, size_t size) override {
-        std::lock_guard<std::mutex> lock(mr_cache_mutex_);
-        
-        // 1. 查找缓存
-        auto it = mr_cache_.find(ptr);
-        if (it != mr_cache_.end()) {
-            // 简单校验: 如果缓存的 MR 大小足够，直接复用
-            // 这里我实现了一个基础的 Address-Based Cache。在生产环境中，我们通常会使用 Interval Tree 来处理 Tensor 内存复用和碎片问题，
-            // 但对于 PyTorch 这种分配器稳定的场景，Ptr-Match 命中率已经 >99%。
-            if (it->second->size() >= size) {
-                // 如果是 DEBUG 模式，可以打印 "MR Cache Hit"
-                // std::cout << "[MR Cache] Hit: " << ptr << " Size: " << size << std::endl;
-                return it->second;
-            } else {
-                // 大小不够，移除旧的（实际可能需要 deregister，shared_ptr 会自动处理析构）
-                mr_cache_.erase(it);
-            }
-        }
-
-        // 2. 缓存未命中 (Miss) -> 昂贵的系统调用
-        // std::cout << "[MR Cache] Miss (Expensive): " << ptr << " Size: " << size << std::endl;
-        auto mr = std::make_shared<RDMAMemoryRegion>(pd_, ptr, size);
-        
-        // 3. 存入缓存
-        mr_cache_[ptr] = mr;
-        return mr;
+        return std::make_shared<RDMAMemoryRegion>(pd_, ptr, size);
     }
-    // <<< 优化结束 <<<
 
     RDMARequest* allocateRequest(uint64_t wr_id) {
         int idx;
@@ -396,10 +373,7 @@ private:
     
     LockFreeQueue<int> free_indices_;
 
-    // >>> 新增: MR Cache 成员 >>>
-    std::unordered_map<void*, std::shared_ptr<MemoryRegion>> mr_cache_;
-    std::mutex mr_cache_mutex_;
-    // <<< 新增结束 <<<
+    // 注意：这里删除了 MR Cache 相关的成员，保持纯净
 
     void init_memory_pool() {
         int pool_size = 4096; 
@@ -409,17 +383,56 @@ private:
         }
     }
 
+    // >>> 🚀 提升六：智能网卡选择 (Smart NIC Selection) >>>
     void setup_device() {
         int num_devices;
         struct ibv_device** dev_list = ibv_get_device_list(&num_devices);
-        if(!dev_list) throw std::runtime_error("No RDMA device");
+        if(!dev_list) throw std::runtime_error("No RDMA device list found");
+
         struct ibv_device* device = nullptr;
+        std::string target_dev_name;
+
+        // 1. 尝试从环境变量读取
+        if (const char* env_dev = std::getenv("MINI_NCCL_NET_DEVICE")) {
+            target_dev_name = std::string(env_dev);
+            std::cout << "[Mini-NCCL] User specified NIC: " << target_dev_name << std::endl;
+        }
+
+        // 2. 遍历查找最佳匹配
         for (int i = 0; i < num_devices; ++i) {
-            if (std::string(ibv_get_device_name(dev_list[i])) == "rxe0") {
-                device = dev_list[i]; break;
+            std::string name = ibv_get_device_name(dev_list[i]);
+            
+            // Case A: 用户指定了设备，必须匹配
+            if (!target_dev_name.empty()) {
+                if (name == target_dev_name) {
+                    device = dev_list[i]; break;
+                }
+                continue;
+            }
+
+            // Case B: 自动检测 (优先级: rxe0 > mlx5 > 其他)
+            if (name == "rxe0") {
+                device = dev_list[i]; 
+                break; // 开发环境最高优先级
+            }
+            if (name.find("mlx5") != std::string::npos) {
+                // 如果还没找到 rxe0，先暂存 mlx5，继续找看有没有 rxe0
+                // 或者直接选第一个发现的 mlx5
+                if (!device) device = dev_list[i];
             }
         }
-        if(!device) throw std::runtime_error("rxe0 not found");
+
+        // 3. 兜底策略：如果上面都没找到，但有设备，就用第一个
+        if (!device && target_dev_name.empty() && num_devices > 0) {
+            device = dev_list[0];
+        }
+
+        if(!device) {
+            ibv_free_device_list(dev_list);
+            throw std::runtime_error("No suitable RDMA device found.");
+        }
+        
+        std::cout << "[Mini-NCCL] Using RDMA Device: " << ibv_get_device_name(device) << std::endl;
         
         bind_to_numa_node(ibv_get_device_name(device));
 
@@ -428,6 +441,7 @@ private:
         cq_ = ibv_create_cq(ctx_, 1024, nullptr, nullptr, 0); 
         ibv_free_device_list(dev_list);
     }
+    // <<< 提升六结束 <<<
 
     void bind_to_numa_node(const std::string& device_name) {
         std::string path = "/sys/class/infiniband/" + device_name + "/device/numa_node";
