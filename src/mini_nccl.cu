@@ -1,5 +1,6 @@
 #include "mini_nccl.h"
 #include "transport/RDMATransport.h"
+#include "Config.h"
 #include <iostream>
 #include <algorithm>
 #include <cuda_runtime.h>
@@ -11,13 +12,11 @@
 
 namespace mini_nccl {
 
-const size_t SLICE_SIZE = 128 * 1024; 
-const int WINDOW_SIZE = 64;   
-const int SIGNAL_BATCH = 16;  
-
 __global__ void wait_kernel(volatile uint32_t* flag_addr, uint32_t expected, volatile uint32_t* abort_flag) {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         while (*flag_addr < expected) {
+            // GPU-Side Polling: 这里是 CUDA Graph 兼容性的关键
+            // 如果 abort_flag 被置位，立即退出防止死锁
             if (*abort_flag != 0) return;
         }
     }
@@ -41,7 +40,6 @@ __global__ void elementwise_reduce_kernel(const T* __restrict__ a, const T* __re
     if (i < n) c[i] = op(a[i], b[i]);
 }
 
-// Step 3.1: 替换 exit(1) 为 throw exception
 void checkCuda(cudaError_t result, const char* msg) {
     if (result != cudaSuccess) {
         std::string err_str = "CUDA Error: " + std::string(msg) + " : " + std::string(cudaGetErrorString(result));
@@ -51,6 +49,12 @@ void checkCuda(cudaError_t result, const char* msg) {
 
 template<typename T, typename Op>
 void allreduce_impl(T* data, int count, Op op, std::shared_ptr<Context> ctx, cudaStream_t stream) {
+    // 获取配置
+    auto& cfg = Config::getInstance();
+    const size_t SLICE_SIZE = cfg.slice_size;
+    const int WINDOW_SIZE = cfg.window_size;
+    const int SIGNAL_BATCH = cfg.signal_batch;
+
     int rank = ctx->rank();
     int size = ctx->size();
     if (size == 1) return;
@@ -215,7 +219,6 @@ void allreduce(void* data, int count, DataType dtype, RedOp op, std::shared_ptr<
         case DataType::Float64: DISPATCH_OP(double, dtype, ctx, stream); break;
         case DataType::Int32:   DISPATCH_OP(int, dtype, ctx, stream); break;
         default: 
-            // Step 3.1: 替换 exit(1) 为 throw exception
             throw std::runtime_error("Unknown DataType!");
     }
 }
