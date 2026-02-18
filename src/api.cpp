@@ -1,14 +1,11 @@
 #include "mini_nccl_api.h"
 #include "mini_nccl.h"             
 #include "transport/RDMATransport.h" 
-#include "hera/hera_worker.h" // 引入 Hera
+#include "hera/hera_worker.h" 
 #include <iostream>
 #include <cstring>
 #include <cuda_runtime.h> 
-
-// >>> 新增: 引入 NVTX 头文件 >>>
 #include <nvtx3/nvToolsExt.h>
-// <<< 新增结束 <<<
 
 using namespace mini_nccl;
 
@@ -22,6 +19,8 @@ const char* ncclGetErrorString(ncclResult_t result) {
         case ncclInternalError: return "internal error";
         case ncclInvalidArgument: return "invalid argument";
         case ncclInvalidUsage: return "invalid usage";
+        case ncclRemoteError: return "remote error";
+        case ncclInProgress: return "in progress";
         default: return "unknown error";
     }
 }
@@ -34,7 +33,7 @@ ncclResult_t ncclCommInitRank(ncclComm_t* comm, int nRanks, int rank, const char
         std::string final_root_ip = (ip) ? std::string(ip) : "127.0.0.1";
 
         // ========================================================
-        // Hera-Core Integration (逻辑保持不变)
+        // Hera-Core Integration
         // ========================================================
         if (rank == -1) {
             std::cout << "[Mini-NCCL] Hera Mode Activated. Connecting to Master at " << final_root_ip << "..." << std::endl;
@@ -50,7 +49,6 @@ ncclResult_t ncclCommInitRank(ncclComm_t* comm, int nRanks, int rank, const char
                       << " Size: " << final_size 
                       << " Root-IP: " << final_root_ip << std::endl;
         }
-        // ========================================================
 
         if (final_rank < 0 || final_rank >= final_size) return ncclInvalidArgument;
 
@@ -141,19 +139,18 @@ ncclResult_t ncclAllReduce(const void* sendbuff, void* recvbuff, size_t count,
     if (!comm || !sendbuff || !recvbuff) return ncclInvalidArgument;
     if (count == 0) return ncclSuccess; 
 
-    // >>> NVTX 埋点开始 >>>
+    // NVTX 埋点
     nvtxEventAttributes_t eventAttrib = {0};
     eventAttrib.version = NVTX_VERSION;
     eventAttrib.size = NVTX_EVENT_ATTRIB_STRUCT_SIZE;
     eventAttrib.colorType = NVTX_COLOR_ARGB;
-    eventAttrib.color = 0xFFFF0000; // 纯红色，在图表中非常醒目
+    eventAttrib.color = 0xFFFF0000; 
     eventAttrib.messageType = NVTX_MESSAGE_TYPE_ASCII;
-    eventAttrib.message.ascii = "mini_ncclAllReduce"; // 时间轴上显示的名字
+    eventAttrib.message.ascii = "mini_ncclAllReduce";
     
     nvtxRangePushEx(&eventAttrib);
-    // <<< 埋点结束 <<<
 
-    // 优化: CUDA Graph (Stream Capture) 感知 >>>
+    // 优化: CUDA Graph (Stream Capture) 感知
     cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
     cudaError_t c_err = cudaStreamIsCapturing(stream, &capture_status);
     
@@ -171,16 +168,15 @@ ncclResult_t ncclAllReduce(const void* sendbuff, void* recvbuff, size_t count,
             warned_graph = true;
         }
     }
-    // <<< 优化结束 <<<
 
     Context* ctx = (Context*)comm;
     try {
         size_t type_size = get_type_size(datatype);
         size_t total_bytes = count * type_size;
 
-        // 简化的指针检查
-        // check_pointer_attributes(sendbuff, "sendbuff");
-        // check_pointer_attributes(recvbuff, "recvbuff");
+        // 优化点: MR Cache >>>
+        // 这里的 registerMemory 会自动使用 Transport 层实现的 LRU/Map Cache。
+        // 对于 PyTorch 这样复用显存地址的框架，第二次调用时将直接命中缓存，从而消除毫秒级的 ibv_reg_mr 开销。
 
         if (sendbuff != recvbuff) {
             cudaMemcpyAsync(recvbuff, sendbuff, total_bytes, cudaMemcpyDeviceToDevice, stream);
@@ -189,16 +185,13 @@ ncclResult_t ncclAllReduce(const void* sendbuff, void* recvbuff, size_t count,
         std::shared_ptr<Context> ctx_ptr(ctx, [](Context*){}); 
         mini_nccl::allreduce(recvbuff, count, to_internal_dtype(datatype), to_internal_op(op), ctx_ptr, stream);
         
-        // >>> 成功返回前 Pop >>>
         nvtxRangePop();
         return ncclSuccess;
     } catch (const std::exception& e) {
-        // >>> 异常返回前 Pop >>>
         nvtxRangePop();
         std::cerr << "[Mini-NCCL] AllReduce Internal Error: " << e.what() << std::endl;
         return ncclInternalError;
     } catch (...) {
-        // >>> 未知异常返回前 Pop >>>
         nvtxRangePop();
         return ncclSystemError;
     }
