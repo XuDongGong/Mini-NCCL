@@ -312,10 +312,25 @@ public:
 
     Request* isend(int rank, std::shared_ptr<MemoryRegion> mr, size_t offset, size_t length) override { return nullptr; }
     Request* irecv(int rank, std::shared_ptr<MemoryRegion> mr, size_t offset, size_t length) override { return nullptr; }
-    
-    // 保持原样，没有 MR Cache
+
     std::shared_ptr<MemoryRegion> registerMemory(void* ptr, size_t size) override {
-        return std::make_shared<RDMAMemoryRegion>(pd_, ptr, size);
+    std::lock_guard<std::mutex> lock(mr_cache_mutex_);
+    
+    // 检查缓存中是否已有该指针对应的 MR
+    auto it = mr_cache_.find(ptr);
+    if (it != mr_cache_.end()) {
+        // 如果缓存的 MR 足够大，则直接复用
+        if (it->second->size() >= size) {
+            return it->second;
+        }
+        // 如果空间不够，移除旧的重新注册
+        mr_cache_.erase(it);
+    }
+    
+    // 缓存未命中，执行昂贵的 ibv_reg_mr
+    auto mr = std::make_shared<RDMAMemoryRegion>(pd_, ptr, size);
+    mr_cache_[ptr] = mr;
+    return mr;
     }
 
     RDMARequest* allocateRequest(uint64_t wr_id) {
@@ -372,6 +387,9 @@ private:
     std::vector<RDMARequest> request_pool_; 
     
     LockFreeQueue<int> free_indices_;
+
+    std::unordered_map<void*, std::shared_ptr<MemoryRegion>> mr_cache_;
+    std::mutex mr_cache_mutex_;
 
     // 注意：这里删除了 MR Cache 相关的成员，保持纯净
 

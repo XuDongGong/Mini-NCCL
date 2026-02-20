@@ -81,12 +81,11 @@ void allreduce_impl(T* data, int count, Op op, std::shared_ptr<Context> ctx, cud
     T* buffers[2];
     std::shared_ptr<MemoryRegion> mr_buffers[2];
     
-    // >>> 🚀 提升五: 使用复用 Buffer >>>
-    // 移除旧的 cudaHostAlloc 代码，改用 get_scratch_buffer
+    // >>> 🚀 提升五: 使用复用 Buffer,从 Context 内存池获取 Buffer >>>
     for(int i=0; i<2; ++i) {
         // 直接从 Context 获取，零开销 (Zero Overhead)
         buffers[i] = (T*)ctx->get_scratch_buffer(i);
-        if (!buffers[i]) throw std::runtime_error("Scratch buffer not allocated or invalid index");
+        if (!buffers[i]) throw std::runtime_error("Buffer pool invalid");
         
         // 注册 MR (配合 MR Cache，这也将是零开销)
         mr_buffers[i] = ctx->registerMemory(buffers[i], SLICE_SIZE);
