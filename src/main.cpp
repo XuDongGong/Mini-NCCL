@@ -1,4 +1,3 @@
-// 注意：只引用公开的 C API 头文件
 #include "mini_nccl_api.h"
 #include <iostream>
 #include <vector>

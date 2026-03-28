@@ -150,16 +150,12 @@ ncclResult_t ncclAllReduce(const void* sendbuff, void* recvbuff, size_t count,
     
     nvtxRangePushEx(&eventAttrib);
 
-    // 优化: CUDA Graph (Stream Capture) 感知
+    // CUDA Graph (Stream Capture) 感知
     cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
     cudaError_t c_err = cudaStreamIsCapturing(stream, &capture_status);
     
     if (c_err == cudaSuccess && capture_status == cudaStreamCaptureStatusActive) {
         // Graph Capture 时，CPU 侧的代码只会被执行一次（录制阶段），而不会被包含在 Graph 中。如果依赖 CPU 轮询 (Polling)，录制生成的 Graph 将不包含同步逻辑，导致执行时错误。
-        // 真正的解决方案是：
-        // 1. 使用 GPU Kernel 轮询内存 (GPU-Side Polling)
-        // 2. 使用 cudaStreamWaitValue (Driver API)
-        
         static bool warned_graph = false;
         if (!warned_graph) {
             std::cerr << "\n[Mini-NCCL] \033[1;33mWARNING: CUDA Graph Capture Detected!\033[0m" << std::endl;
@@ -173,10 +169,6 @@ ncclResult_t ncclAllReduce(const void* sendbuff, void* recvbuff, size_t count,
     try {
         size_t type_size = get_type_size(datatype);
         size_t total_bytes = count * type_size;
-
-        // 优化点: MR Cache >>>
-        // 这里的 registerMemory 会自动使用 Transport 层实现的 LRU/Map Cache。
-        // 对于 PyTorch 这样复用显存地址的框架，第二次调用时将直接命中缓存，从而消除毫秒级的 ibv_reg_mr 开销。
 
         if (sendbuff != recvbuff) {
             cudaMemcpyAsync(recvbuff, sendbuff, total_bytes, cudaMemcpyDeviceToDevice, stream);

@@ -32,7 +32,7 @@ struct DynamicMemInfo {
     cudaIpcMemHandle_t buf1_ipc;
 };
 
-// 保持原有的 RdmaInfo 定义
+// RdmaInfo 定义
 struct RdmaInfo {
     int rank;
     uint32_t qp_num;
@@ -88,7 +88,7 @@ private:
     int pool_idx_; 
 };
 
-// 保持原有的 PeerIpcPtrs 定义
+// PeerIpcPtrs 定义
 struct PeerIpcPtrs {
     bool is_local = false;
     void* flag_ptr = nullptr;
@@ -391,8 +391,6 @@ private:
     std::unordered_map<void*, std::shared_ptr<MemoryRegion>> mr_cache_;
     std::mutex mr_cache_mutex_;
 
-    // 注意：这里删除了 MR Cache 相关的成员，保持纯净
-
     void init_memory_pool() {
         int pool_size = 4096; 
         request_pool_.resize(pool_size);
@@ -401,7 +399,6 @@ private:
         }
     }
 
-    // >>> 🚀 提升六：智能网卡选择 (Smart NIC Selection) >>>
     void setup_device() {
         int num_devices;
         struct ibv_device** dev_list = ibv_get_device_list(&num_devices);
@@ -459,7 +456,6 @@ private:
         cq_ = ibv_create_cq(ctx_, 1024, nullptr, nullptr, 0); 
         ibv_free_device_list(dev_list);
     }
-    // <<< 提升六结束 <<<
 
     void bind_to_numa_node(const std::string& device_name) {
         std::string path = "/sys/class/infiniband/" + device_name + "/device/numa_node";

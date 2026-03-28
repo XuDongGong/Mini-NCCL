@@ -3,7 +3,7 @@
 #include <string>
 #include <cuda_runtime.h>
 #include <infiniband/verbs.h>
-#include "tcp_socket.hpp" // 刚才写的头文件
+#include "tcp_socket.hpp"
 
 #define CUDA_CHECK(call) \
     do { \
@@ -14,7 +14,7 @@
         } \
     } while (0)
 
-// --- 我们要交换的“名片”结构体 ---
+// --- 交换的“名片”结构体 ---
 struct RdmaInfo {
     uint32_t qp_num;   // QP 号码
     uint16_t lid;      // Local ID (InfiniBand 地址)
@@ -41,7 +41,7 @@ int main(int argc, char** argv) {
         tcp.connect_to(server_ip, 8888);
     }
 
-    // 2. 初始化 RDMA 资源 (和之前一样)
+    // 2. 初始化 RDMA 资源
     int num_devices;
     struct ibv_device** dev_list = ibv_get_device_list(&num_devices);
     struct ibv_device* rxe_dev = nullptr;
@@ -92,7 +92,7 @@ int main(int argc, char** argv) {
     local_info.rkey = mr->rkey;
     memcpy(local_info.gid, my_gid.raw, 16);
 
-    // 6. 核心步骤：通过 TCP 交换名片！
+    // 6. 通过 TCP 交换名片
     RdmaInfo remote_info;
     // 先发我的，再收对方的
     tcp.send_data(&local_info, sizeof(RdmaInfo));
@@ -101,8 +101,6 @@ int main(int argc, char** argv) {
     std::cout << "[TCP] Exchanged info with peer. Remote QP: " << remote_info.qp_num << std::endl;
 
     // 7. 使用对方的名片，把 QP 状态机转到底 (INIT -> RTR -> RTS)
-    // 注意：这里的 dest_qp_num 现在是 remote_info.qp_num 了！
-    
     struct ibv_qp_attr attr = {};
     // -> INIT
     attr.qp_state = IBV_QPS_INIT;
@@ -155,7 +153,7 @@ int main(int argc, char** argv) {
     recv_wr.num_sge = 1;
     recv_wr.wr_id = 100;
     struct ibv_recv_wr* bad_recv;
-    ibv_post_recv(qp, &recv_wr, &bad_recv); // 大家都要先准备好“篮子”接数据
+    ibv_post_recv(qp, &recv_wr, &bad_recv);
 
     // 简单做一个同步：等大家都准备好 recv
     char sync = 'G';
@@ -190,7 +188,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    // 暂停一下让用户看结果
+    // 暂停一下看结果
     sleep(1);
     return 0;
 }

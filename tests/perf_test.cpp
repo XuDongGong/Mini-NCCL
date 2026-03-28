@@ -78,7 +78,6 @@ int main(int argc, char* argv[]) {
         CUDA_CHECK(cudaHostAlloc(&d_send, size, cudaHostAllocDefault));
         CUDA_CHECK(cudaHostAlloc(&d_recv, size, cudaHostAllocDefault));
 
-        // >>> 1. 数据初始化 <<<
         // 发送方全部填 1.0
         std::fill(d_send, d_send + count, 1.0f);
         // 接收方清零
@@ -99,7 +98,6 @@ int main(int argc, char* argv[]) {
         CUDA_CHECK(cudaStreamSynchronize(stream));
         double end = get_us();
 
-        // >>> 2. SIMD (AVX2) 极速校验 <<<
         // 预期结果：每个 Rank 都发了 1.0，AllReduce Sum 后应该是 nRanks * 1.0
         float expected_val = (float)nRanks; 
         bool pass = true;
@@ -109,20 +107,13 @@ int main(int argc, char* argv[]) {
         
         int i = 0;
         // 每次处理 8 个 float (256 bits)
-        // cudaHostAlloc 保证了内存对齐，所以可以用 _mm256_load_ps (Aligned Load)
         for (; i <= count - 8; i += 8) {
             __m256 loaded_data = _mm256_load_ps(&d_recv[i]);
-            
-            // 并行比较：不相等则对应的掩码位为 1
-            // _CMP_NEQ_OQ: Not Equal (Ordered, Non-signaling)
             __m256 cmp_res = _mm256_cmp_ps(loaded_data, target_vec, _CMP_NEQ_OQ);
-            
-            // 将 256 位掩码压缩为 8 位整数
             int mask = _mm256_movemask_ps(cmp_res);
             
             if (mask != 0) {
                 pass = false;
-                // 找到具体的错误索引方便调试
                 for(int k=0; k<8; ++k) {
                     if ((mask >> k) & 1) {
                         printf("[SIMD Check] Mismatch at index %d: expected %.1f, got %.1f\n", 
@@ -133,8 +124,7 @@ int main(int argc, char* argv[]) {
                 break; // 发现错误立即停止
             }
         }
-        
-        // 处理尾部剩余元素 (无法凑齐 8 个的部分)
+
         for (; i < count; ++i) {
             if (std::abs(d_recv[i] - expected_val) > 1e-5) {
                 pass = false;
@@ -145,7 +135,6 @@ int main(int argc, char* argv[]) {
 
         if (!pass) {
             printf("[Rank %d] Verification FAILED for size %lu\n", final_rank, size);
-            // 这里我们只打印错误，不退出，以便查看后续测试
         }
 
         double avg_time_us = (end - start) / iterations;

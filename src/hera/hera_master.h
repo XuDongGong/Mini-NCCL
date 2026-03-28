@@ -12,7 +12,7 @@ namespace hera {
 struct WorkerContext {
     int fd;
     std::string hostname;
-    std::string ip; // 新增: 记录 IP
+    std::string ip;
     int pid;
     int rank;
 };
@@ -91,7 +91,7 @@ private:
         resp.rank = rank;
         resp.world_size = world_size_;
         
-        // 核心逻辑: 填充 Rank 0 的 IP
+        //  填充 Rank 0 的 IP
         // 如果我是 Rank 0，那 Root IP 就是我自己
         // 如果我是 Rank N，那 Root IP 是列表里第一个人的 IP
         std::string root_ip = worker_infos_[0].ip;

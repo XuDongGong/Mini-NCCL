@@ -50,8 +50,7 @@ private:
         if (slice_size == 0) slice_size = 1024;
         if (window_size <= 0) window_size = 1;
         
-        // 只在 Rank 0 或首次调用时打印，避免刷屏 (这里简单处理，打印到 stderr)
-        // 实际生产中可以使用 std::call_once
+        // 只在 Rank 0 或首次调用时打印，避免刷屏
         static bool printed = false;
         if (!printed) {
             std::cerr << "[Config] Loaded: SLICE_SIZE=" << slice_size 

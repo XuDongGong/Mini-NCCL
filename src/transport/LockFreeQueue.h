@@ -29,7 +29,7 @@ public:
         size_t next_tail = (current_tail + 1) % buffer_.size();
 
         // 检查是否已满
-        // 优化: 在高性能场景下，我们假设队列容量足够大(4096)，满是小概率事件
+        // 在高性能场景下，我们假设队列容量足够大(4096)，满是小概率事件
         // 使用 unlikely 提示编译器将错误处理逻辑移出热路径
         if (unlikely(next_tail == head_.load(std::memory_order_acquire))) {
             return false; 
@@ -45,7 +45,7 @@ public:
         size_t current_head = head_.load(std::memory_order_relaxed);
         
         // 检查是否为空
-        // 注意: 对于轮询消费者，空队列可能是常态，所以这里不加 unlikely
+        // 对于轮询消费者，空队列可能是常态，所以这里不加 unlikely
         if (current_head == tail_.load(std::memory_order_acquire)) {
             return false; 
         }

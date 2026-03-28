@@ -33,7 +33,7 @@ struct __attribute__((packed)) RegisterReq {
 struct __attribute__((packed)) RegisterResp {
     int rank;             
     int world_size;       
-    char root_ip[64];     // 新增: Rank 0 的 IP 地址，用于引导 RDMA 组网
+    char root_ip[64];     //Rank 0 的 IP 地址，用于引导 RDMA 组网
 };
 
 struct __attribute__((packed)) TopologyInfo {

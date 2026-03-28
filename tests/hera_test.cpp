@@ -12,11 +12,6 @@ void worker_thread_func(int id) {
     
     hera::HeraWorker worker("127.0.0.1", 9999);
     worker.ConnectAndRegister();
-    
-    // 验证逻辑
-    // 在我们的简单实现中，Master 按顺序分配 Rank
-    // 但多线程下顺序不一定严格，所以我们只打印
-    // assert(worker.rank() >= 0); 
 }
 
 int main() {
@@ -46,7 +41,7 @@ int main() {
     
     std::cout << "=== All Workers Joined! Test Passed. ===" << std::endl;
 
-    // 强制退出测试 (Master 还在 loop 中)
+    // 强制退出测试
     std::this_thread::sleep_for(std::chrono::seconds(1));
     exit(0); 
     return 0;

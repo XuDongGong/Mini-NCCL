@@ -12,7 +12,7 @@ class HeraWorker {
     
     int my_rank_ = -1;
     int world_size_ = -1;
-    std::string root_ip_; // 新增: 存储从 Master 获取的 Root IP
+    std::string root_ip_; // 存储从 Master 获取的 Root IP
 
 public:
     HeraWorker(const std::string& master_ip, int port = HERA_DEFAULT_PORT)
@@ -40,7 +40,7 @@ public:
             auto* resp = (RegisterResp*)buffer.data();
             my_rank_ = resp->rank;
             world_size_ = resp->world_size;
-            root_ip_ = std::string(resp->root_ip); // 解析 Root IP
+            root_ip_ = std::string(resp->root_ip);
 
             std::cout << "[Hera-Worker] Registered! Rank=" << my_rank_ 
                       << "/" << world_size_ << " RootIP=" << root_ip_ << std::endl;
@@ -53,7 +53,7 @@ public:
 
     int rank() const { return my_rank_; }
     int size() const { return world_size_; }
-    std::string root_ip() const { return root_ip_; } // 提供 Getter
+    std::string root_ip() const { return root_ip_; }
 };
 
 } // namespace hera

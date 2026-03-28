@@ -66,14 +66,10 @@ public:
                            uint64_t remote_addr, uint32_t remote_rkey, bool signaled = true) = 0;
 
     virtual Request* write_signal(int rank, int flag_idx, uint32_t value, bool signaled = true) = 0;
-    
-    // 注意：这里为了保持 API 简单，我们暂时不在基类展开 DynamicInfo 的参数
-    // 实际调用时会使用 dynamic_pointer_cast<RDMATransport>
 };
 
 class Context {
 public:
-    // 修改: 构造函数改为声明，实现在 .cu 文件中
     Context(int rank, int size, std::shared_ptr<Transport> transport);
     
     ~Context() {
@@ -88,9 +84,8 @@ public:
         return transport_->registerMemory(ptr, size);
     }
 
-    // >>> 🚀 提升五: 内存复用机制接口 >>>
     void* get_scratch_buffer(int idx) {
-        // 简单的双缓冲索引检查
+        // 双缓冲索引检查
         if (idx < 0 || idx > 1) return nullptr;
         if (!host_buffer_) return nullptr;
         return (char*)host_buffer_ + idx * max_slice_size_;
@@ -99,15 +94,11 @@ public:
     void allocate_scratch_buffer(size_t slice_size) {
         if (host_buffer_) return; 
         max_slice_size_ = slice_size; 
-        // 关键点: 使用 cudaHostAllocMapped 
-        // 1. 允许 GPU Kernel 直接访问 (Zero-Copy)
-        // 2. 避免 "invalid argument" 或 Sticky Error
         cudaError_t err = cudaHostAlloc(&host_buffer_, max_slice_size_ * 2, cudaHostAllocMapped);
         if (err != cudaSuccess) {
             throw std::runtime_error("Failed to allocate context scratch buffer: " + std::string(cudaGetErrorString(err)));
         }
     }
-    // <<< 提升五结束 <<<
 
 private:
     int rank_;

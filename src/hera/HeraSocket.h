@@ -34,7 +34,7 @@ public:
     int fd() const { return fd_; }
     bool is_valid() const { return fd_ > 0; }
 
-    // 获取对端 IP 地址 (新增!)
+    // 获取对端 IP 地址
     std::string GetPeerIP() const {
         if (fd_ < 0) return "";
         struct sockaddr_in addr;

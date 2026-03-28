@@ -11,8 +11,6 @@
 #include <string>
 
 namespace mini_nccl {
-
-// >>> 🚀 提升五: Context 构造函数实现 >>>
 Context::Context(int rank, int size, std::shared_ptr<Transport> transport)
     : rank_(rank), size_(size), transport_(transport) {
     // 在 Context 初始化时，直接根据配置预分配内存
@@ -20,7 +18,6 @@ Context::Context(int rank, int size, std::shared_ptr<Transport> transport)
     size_t slice = Config::getInstance().slice_size;
     allocate_scratch_buffer(slice);
 }
-// <<< 提升五结束 <<<
 
 __global__ void wait_kernel(volatile uint32_t* flag_addr, uint32_t expected, volatile uint32_t* abort_flag) {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
@@ -81,7 +78,7 @@ void allreduce_impl(T* data, int count, Op op, std::shared_ptr<Context> ctx, cud
     T* buffers[2];
     std::shared_ptr<MemoryRegion> mr_buffers[2];
     
-    // >>> 🚀 提升五: 使用复用 Buffer,从 Context 内存池获取 Buffer >>>
+    // 使用复用 Buffer,从 Context 内存池获取 Buffer
     for(int i=0; i<2; ++i) {
         // 直接从 Context 获取，零开销 (Zero Overhead)
         buffers[i] = (T*)ctx->get_scratch_buffer(i);
@@ -90,7 +87,6 @@ void allreduce_impl(T* data, int count, Op op, std::shared_ptr<Context> ctx, cud
         // 注册 MR (配合 MR Cache，这也将是零开销)
         mr_buffers[i] = ctx->registerMemory(buffers[i], SLICE_SIZE);
     }
-    // <<< 提升五结束 <<<
 
     transport->exchange_dynamic_info(
         (uint64_t)mr_data->ptr(), mr_data->rkey(),
@@ -218,7 +214,6 @@ void allreduce_impl(T* data, int count, Op op, std::shared_ptr<Context> ctx, cud
     }
     
     checkCuda(cudaGetLastError(), "Final Check");
-    // 不再需要 cudaFreeHost(buffers[i])，因为它是 Context 管理的
 }
 
 #define DISPATCH_OP(TYPE_T, TYPE_ENUM, CTX, STREAM) \

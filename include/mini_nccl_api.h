@@ -18,14 +18,14 @@ typedef enum {
     ncclSystemError = 2,
     ncclInternalError = 3,
     ncclInvalidArgument = 4,
-    ncclInvalidUsage = 5,       // 新增: 用法错误
-    ncclRemoteError = 6,        // 新增: 远端错误
-    ncclInProgress = 7          // 新增: 进行中
+    ncclInvalidUsage = 5,       // 用法错误
+    ncclRemoteError = 6,        // 远端错误
+    ncclInProgress = 7          // 进行中
 } ncclResult_t;
 
 typedef struct ncclComm* ncclComm_t;
 
-// 完整的 NCCL 数据类型定义
+// NCCL 数据类型定义
 typedef enum { 
     ncclInt8       = 0, 
     ncclUint8      = 1, 
@@ -39,7 +39,7 @@ typedef enum {
     ncclBfloat16   = 9 
 } ncclDataType_t;
 
-// 完整的 NCCL 操作定义
+// NCCL 操作定义
 typedef enum { 
     ncclSum        = 0, 
     ncclProd       = 1, 

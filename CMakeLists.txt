@@ -20,9 +20,7 @@ endif()
 find_package(CUDAToolkit REQUIRED)
 find_library(IBVERBS_LIB ibverbs REQUIRED)
 
-# >>> 新增: 查找 NVTX 库 >>>
 find_library(NVTX_LIB nvToolsExt REQUIRED)
-# <<< 新增结束 <<<
 
 # ========================================================
 # 3. 构建核心库 (libmini_nccl.so)
@@ -35,9 +33,8 @@ set(LIB_SOURCES src/mini_nccl.cu src/api.cpp)
 
 add_library(mini_nccl SHARED ${LIB_SOURCES})
 
-# >>> 修改: 链接 NVTX 库 >>>
+#  链接 NVTX 库
 target_link_libraries(mini_nccl PRIVATE ${IBVERBS_LIB} CUDA::cudart ${NVTX_LIB})
-# <<< 修改结束 <<<
 
 # 设置公共头文件路径
 target_include_directories(mini_nccl PUBLIC 
@@ -53,7 +50,7 @@ target_link_libraries(app mini_nccl CUDA::cudart)
 
 add_executable(perf_test tests/perf_test.cpp)
 target_link_libraries(perf_test mini_nccl CUDA::cudart)
-# >>> 修复：开启 AVX2 指令集支持 <<<
+# 开启 AVX2 指令集支持 
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(perf_test PRIVATE -mavx2 -mfma)
 endif()

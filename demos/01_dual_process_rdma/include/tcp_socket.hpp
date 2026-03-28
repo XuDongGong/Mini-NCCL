@@ -12,7 +12,7 @@ class TCPSocket {
 public:
     int sockfd = -1;
 
-    // 1. 作为服务端启动 (Server)
+    // 1. 服务端启动 (Server)
     void listen_on(int port) {
         sockfd = socket(AF_INET, SOCK_STREAM, 0);
         int opt = 1;
@@ -32,12 +32,12 @@ public:
         int new_fd = accept(sockfd, nullptr, nullptr);
         if (new_fd < 0) { perror("Accept failed"); exit(1); }
         
-        close(sockfd); // 既然连上了，旧的监听口就不要了
+        close(sockfd);
         sockfd = new_fd;
         std::cout << "[TCP] Connection established!" << std::endl;
     }
 
-    // 2. 作为客户端连接 (Client)
+    // 2. 客户端连接 (Client)
     void connect_to(const std::string& ip, int port) {
         sockfd = socket(AF_INET, SOCK_STREAM, 0);
         struct sockaddr_in addr;
@@ -45,7 +45,7 @@ public:
         addr.sin_port = htons(port);
         inet_pton(AF_INET, ip.c_str(), &addr.sin_addr);
 
-        // 简单的重试逻辑
+        // 重试
         while (connect(sockfd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
             std::cout << "[TCP] Connecting to " << ip << "..." << std::endl;
             sleep(1);
@@ -53,7 +53,6 @@ public:
         std::cout << "[TCP] Connected to server!" << std::endl;
     }
 
-    // 3. 发送任意数据
     void send_data(void* data, size_t size) {
         size_t total = 0;
         while (total < size) {
@@ -63,7 +62,6 @@ public:
         }
     }
 
-    // 4. 接收任意数据
     void recv_data(void* data, size_t size) {
         size_t total = 0;
         while (total < size) {
